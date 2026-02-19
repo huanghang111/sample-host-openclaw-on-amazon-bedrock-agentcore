@@ -2,23 +2,17 @@
  * Bedrock Proxy Adapter
  *
  * Translates OpenAI-compatible chat completion requests from OpenClaw
- * into either direct Bedrock Converse API calls or AgentCore Runtime
- * invocations, depending on the PROXY_MODE environment variable.
- *
- * Modes:
- *   - "bedrock-direct" (default): Uses Bedrock ConverseStream API directly
- *   - "agentcore": Routes through AgentCore Runtime endpoint
+ * into Bedrock Converse API calls. Runs inside the OpenClaw container
+ * hosted on AgentCore Runtime.
  */
 
 const http = require("http");
 const crypto = require("crypto");
 
 const PORT = 18790;
-const AWS_REGION = process.env.AWS_REGION || "ap-southeast-2";
+const AWS_REGION = process.env.AWS_REGION || "us-west-2";
 const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "au.anthropic.claude-sonnet-4-6";
-const PROXY_MODE = process.env.PROXY_MODE || "bedrock-direct";
-const AGENTCORE_RUNTIME_ENDPOINT_ID = process.env.AGENTCORE_RUNTIME_ENDPOINT_ID || "";
+  process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-4-6";
 
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
@@ -46,31 +40,6 @@ function sleep(ms) {
 }
 
 /**
- * Parse an OpenClaw session key to extract channel and actor identity.
- *
- * Session key formats:
- *   agent:{agentId}:{channel}:{peerId}                    (DM)
- *   agent:{agentId}:{channel}:group:{groupId}             (group chat)
- *   agent:{agentId}:{channel}:channel:{channelId}         (channel chat)
- *   agent:{agentId}:{channel}:group:{groupId}:topic:{id}  (forum topic)
- *   main                                                   (default/fallback)
- */
-function parseSessionKey(sessionKey) {
-  let channel = "unknown";
-  let actorId = "";
-
-  // "agent:{agentId}:{channel}:{rest}" — standard format
-  const agentMatch = sessionKey.match(/^agent:[^:]+:([^:]+):(.+)$/);
-  if (agentMatch) {
-    channel = agentMatch[1];
-    actorId = `${channel}:${agentMatch[2]}`;
-    return { channel, actorId };
-  }
-
-  return { channel, actorId };
-}
-
-/**
  * Extract session metadata from request headers and body.
  * Returns { sessionId, actorId, channel }.
  */
@@ -80,61 +49,23 @@ function extractSessionMetadata(parsed, headers) {
   let channel = headers["x-openclaw-channel"] || "unknown";
   let sessionId = headers["x-openclaw-session-id"] || "";
 
-  // 2. Parse OpenClaw system prompt for identity signals
-  if (!actorId && parsed.messages) {
-    const systemMsg = parsed.messages.find(m => m.role === "system");
-    if (systemMsg) {
-      const content = typeof systemMsg.content === "string"
-        ? systemMsg.content : "";
-
-      // 2a. Extract chat_id from system prompt JSON examples (e.g. "chat_id": "telegram:6087229962")
-      const chatIdMatch = content.match(/"chat_id":\s*"((?:telegram|discord|slack|whatsapp|web|signal|imessage):([^"]+))"/i);
-      if (chatIdMatch) {
-        actorId = chatIdMatch[1];
-        channel = chatIdMatch[1].split(":")[0].toLowerCase();
-      }
-
-      // 2b. Fallback: parse Session: line (e.g. "Session: agent:main:telegram:123456789 •")
-      if (!actorId) {
-        const sessionMatch = content.match(/Session:\s+(\S+)/);
-        if (sessionMatch) {
-          const sk = parseSessionKey(sessionMatch[1]);
-          if (sk.actorId) actorId = sk.actorId;
-          if (sk.channel !== "unknown") channel = sk.channel;
-        }
-      }
-
-      // 2c. Fallback: extract channel from "channel": "telegram" in system prompt
-      if (channel === "unknown") {
-        const channelMatch = content.match(/"channel":\s*"(telegram|discord|slack|whatsapp|web|signal|imessage)"/i);
-        if (channelMatch) channel = channelMatch[1].toLowerCase();
-      }
-
-      // 2d. Fallback: extract channel from Runtime line
-      if (channel === "unknown") {
-        const rtMatch = content.match(
-          /Runtime:.*·\s+(telegram|discord|slack|whatsapp|web|signal|imessage)\b/i
-        );
-        if (rtMatch) channel = rtMatch[1].toLowerCase();
-      }
-    }
-  }
-
-  // 3. Check OpenAI 'user' field
+  // 2. Check OpenAI 'user' field (OpenClaw may populate this)
   if (!actorId && parsed.user) {
     actorId = parsed.user;
   }
 
-  // 4. Fallback to default
+  // 3. Fallback to default
   if (!actorId) {
     actorId = "default-user";
   }
 
-  // Generate stable session ID
+  // 4. Generate stable session ID (AgentCore requires min 33 chars)
   if (!sessionId) {
     const key = `${actorId}:${channel}`;
     if (!sessionMap.has(key)) {
-      sessionMap.set(key, `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      const ts = Date.now().toString(36);
+      const rand = crypto.randomBytes(12).toString("hex");
+      sessionMap.set(key, `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`);
     }
     sessionId = sessionMap.get(key);
   }
@@ -409,173 +340,6 @@ async function invokeBedrockStreaming(messages, res, model) {
 }
 
 /**
- * Invoke AgentCore Runtime endpoint (non-streaming).
- * Collects the full response from the async iterator.
- */
-async function invokeAgentCore(messages, sessionId, actorId, channel) {
-  const { BedrockAgentRuntimeClient, InvokeAgentCommand } = require(
-    "@aws-sdk/client-bedrock-agent-runtime"
-  );
-  const client = new BedrockAgentRuntimeClient({ region: AWS_REGION });
-
-  // Extract the last user message as the prompt
-  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-  const prompt = lastUserMsg
-    ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-    : "";
-
-  let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
-        console.log(`[proxy] AgentCore retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`);
-        await sleep(delay);
-      }
-
-      const response = await client.send(
-        new InvokeAgentCommand({
-          agentId: AGENTCORE_RUNTIME_ENDPOINT_ID,
-          agentAliasId: "TSTALIASID",
-          sessionId: sessionId,
-          inputText: prompt,
-          sessionState: {
-            promptSessionAttributes: {
-              actor_id: actorId,
-              channel: channel,
-            },
-          },
-        })
-      );
-
-      // Collect full response from async iterator
-      let fullText = "";
-      if (response.completion) {
-        for await (const event of response.completion) {
-          if (event.chunk?.bytes) {
-            fullText += new TextDecoder().decode(event.chunk.bytes);
-          }
-        }
-      }
-
-      return {
-        text: fullText || "I received your message but have no response.",
-        usage: {},
-      };
-    } catch (err) {
-      lastError = err;
-      console.error(`[proxy] AgentCore invocation attempt ${attempt + 1} failed:`, err.message);
-      if (err.$metadata && err.$metadata.httpStatusCode < 500) break;
-    }
-  }
-  throw lastError || new Error("AgentCore invocation failed after retries");
-}
-
-/**
- * Invoke AgentCore Runtime endpoint with SSE streaming to the HTTP response.
- */
-async function invokeAgentCoreStreaming(messages, res, model, sessionId, actorId, channel) {
-  const { BedrockAgentRuntimeClient, InvokeAgentCommand } = require(
-    "@aws-sdk/client-bedrock-agent-runtime"
-  );
-  const client = new BedrockAgentRuntimeClient({ region: AWS_REGION });
-
-  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-  const prompt = lastUserMsg
-    ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-    : "";
-
-  const chatId = `chatcmpl-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
-        console.log(`[proxy] AgentCore stream retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`);
-        await sleep(delay);
-      }
-
-      const response = await client.send(
-        new InvokeAgentCommand({
-          agentId: AGENTCORE_RUNTIME_ENDPOINT_ID,
-          agentAliasId: "TSTALIASID",
-          sessionId: sessionId,
-          inputText: prompt,
-          sessionState: {
-            promptSessionAttributes: {
-              actor_id: actorId,
-              channel: channel,
-            },
-          },
-        })
-      );
-
-      // Write SSE headers
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      });
-
-      if (response.completion) {
-        for await (const event of response.completion) {
-          if (event.chunk?.bytes) {
-            const text = new TextDecoder().decode(event.chunk.bytes);
-            const chunk = {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model: model || MODEL_ID,
-              choices: [{
-                index: 0,
-                delta: { content: text },
-                finish_reason: null,
-              }],
-            };
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-          }
-        }
-      }
-
-      // Final chunk + [DONE]
-      const finalChunk = {
-        id: chatId,
-        object: "chat.completion.chunk",
-        created,
-        model: model || MODEL_ID,
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: "stop",
-        }],
-      };
-      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
-
-      console.log(`[proxy] AgentCore stream complete`);
-      return;
-    } catch (err) {
-      lastError = err;
-      console.error(`[proxy] AgentCore stream attempt ${attempt + 1} failed:`, err.message);
-      if (err.$metadata && err.$metadata.httpStatusCode < 500) break;
-    }
-  }
-
-  // If all retries failed and headers not yet sent
-  if (!res.headersSent) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: { message: "AgentCore streaming failed: " + lastError.message, type: "proxy_error" },
-    }));
-  } else {
-    res.end();
-  }
-}
-
-/**
  * Format a response as an OpenAI-compatible chat completion response.
  */
 function formatChatResponse(result, model) {
@@ -612,7 +376,6 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       status: "ok",
       model: MODEL_ID,
-      mode: PROXY_MODE,
       cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
     }));
     return;
@@ -629,7 +392,7 @@ const server = http.createServer(async (req, res) => {
         const stream = parsed.stream === true;
 
         console.log(
-          `[proxy] Incoming request: ${messages.length} messages, model=${parsed.model || MODEL_ID}, stream=${stream}, mode=${PROXY_MODE}`
+          `[proxy] Incoming request: ${messages.length} messages, model=${parsed.model || MODEL_ID}, stream=${stream}`
         );
 
         // Extract identity for all modes (used for logging + Cognito)
@@ -643,32 +406,17 @@ const server = http.createServer(async (req, res) => {
           console.warn(`[proxy] Cognito token acquisition failed for ${actorId}:`, err.message);
         }
 
-        if (PROXY_MODE === "agentcore" && AGENTCORE_RUNTIME_ENDPOINT_ID) {
-          // --- AgentCore path ---
-          console.log(`[proxy] AgentCore: session=${sessionId} actor=${actorId} channel=${channel} jwt=${cognitoToken ? "yes" : "no"}`);
-
-          if (stream) {
-            await invokeAgentCoreStreaming(messages, res, parsed.model, sessionId, actorId, channel);
-          } else {
-            const result = await invokeAgentCore(messages, sessionId, actorId, channel);
-            const response = formatChatResponse(result, parsed.model);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(response));
-          }
+        // --- Direct Bedrock path ---
+        if (stream) {
+          await invokeBedrockStreaming(messages, res, parsed.model);
         } else {
-          // --- Direct Bedrock path (default) ---
-          console.log(`[proxy] Bedrock: actor=${actorId} channel=${channel} jwt=${cognitoToken ? "yes" : "no"}`);
-          if (stream) {
-            await invokeBedrockStreaming(messages, res, parsed.model);
-          } else {
-            const result = await invokeBedrock(messages);
-            const response = formatChatResponse(result, parsed.model);
-            console.log(
-              `[proxy] Response: ${result.usage.inputTokens || "?"}in/${result.usage.outputTokens || "?"}out tokens`
-            );
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(response));
-          }
+          const result = await invokeBedrock(messages);
+          const response = formatChatResponse(result, parsed.model);
+          console.log(
+            `[proxy] Response: ${result.usage.inputTokens || "?"}in/${result.usage.outputTokens || "?"}out tokens`
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(response));
         }
       } catch (err) {
         console.error("[proxy] Request failed:", err.message);
@@ -712,11 +460,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `[proxy] Bedrock proxy adapter listening on http://0.0.0.0:${PORT} (model: ${MODEL_ID}, mode: ${PROXY_MODE})`
+    `[proxy] Bedrock proxy adapter listening on http://0.0.0.0:${PORT} (model: ${MODEL_ID})`
   );
-  if (PROXY_MODE === "agentcore") {
-    console.log(`[proxy] AgentCore endpoint: ${AGENTCORE_RUNTIME_ENDPOINT_ID || "(not set)"}`);
-  }
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`
   );
