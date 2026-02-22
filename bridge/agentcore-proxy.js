@@ -1423,20 +1423,39 @@ const server = http.createServer(async (req, res) => {
         }
 
         // --- Retrieve memory context for this user ---
-        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+        const lastUserMsg = [...messages]
+          .reverse()
+          .find((m) => m.role === "user");
         const lastUserText = lastUserMsg
-          ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
+          ? typeof lastUserMsg.content === "string"
+            ? lastUserMsg.content
+            : JSON.stringify(lastUserMsg.content)
           : "";
-        const memoryContext = await retrieveMemoryContext(actorId, lastUserText);
+        const memoryContext = await retrieveMemoryContext(
+          actorId,
+          lastUserText,
+        );
 
-        // Build augmented system text if memory context is available
-        let systemTextOverride = null;
-        if (memoryContext) {
-          const systemMessages = messages.filter((m) => m.role === "system");
-          const baseSystemText = systemMessages.length > 0
+        // Build augmented system text with user identity + memory context.
+        // Identity is ALWAYS injected; memory context may be empty string.
+        const identityContext = await buildUserIdentityContext(
+          actorId,
+          channel,
+        );
+        const systemMessages = messages.filter((m) => m.role === "system");
+        const baseSystemText =
+          systemMessages.length > 0
             ? systemMessages.map((m) => m.content).join("\n")
             : SYSTEM_PROMPT;
-          systemTextOverride = baseSystemText + memoryContext;
+        const systemTextOverride =
+          baseSystemText + identityContext + memoryContext;
+
+        // --- Convert OpenAI tools to Bedrock toolConfig ---
+        const toolConfig = convertTools(parsed.tools);
+        if (toolConfig) {
+          console.log(
+            `[proxy] Tools: ${toolConfig.tools.length} tool(s) forwarded to Bedrock`,
+          );
         }
 
         // --- Direct Bedrock path ---
@@ -1462,7 +1481,12 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify(response));
           // Fire-and-forget: store conversation in memory
           if (result.text && lastUserText) {
-            storeConversationEvent(actorId, sessionId, lastUserText, result.text).catch(() => {});
+            storeConversationEvent(
+              actorId,
+              sessionId,
+              lastUserText,
+              result.text,
+            ).catch(() => {});
           }
         }
       } catch (err) {
@@ -1513,7 +1537,7 @@ server.listen(PORT, "0.0.0.0", () => {
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
   );
   console.log(
-    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`
+    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`,
   );
   startMemoryExtractionTimer();
 });

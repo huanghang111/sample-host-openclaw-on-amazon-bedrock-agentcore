@@ -22,6 +22,8 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_ecr as ecr,
     aws_iam as iam,
+    aws_kms as kms,
+    aws_s3 as s3,
 )
 import cdk_nag
 from constructs import Construct
@@ -300,6 +302,16 @@ class AgentCoreStack(Stack):
                 ),
             ],
             apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.user_files_bucket,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-S1",
+                    reason="Server access logging not required for user file storage — "
+                    "CloudTrail S3 data events provide sufficient audit trail.",
+                ),
+            ],
         )
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.user_files_bucket,
