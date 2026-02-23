@@ -532,24 +532,20 @@ The Router Lambda validates all incoming webhook requests:
 
 Requests that fail validation receive a 401 response and are logged with the source IP.
 
-### Per-User Memory
+### Per-User Workspace
 
-Each user gets isolated, persistent conversation memory powered by AgentCore Memory. The proxy handles all memory operations transparently — OpenClaw is unaware of the memory layer.
+Each user gets 6 workspace files auto-provisioned in S3 on first interaction:
 
-**How it works:**
+| File | Purpose |
+|---|---|
+| `AGENTS.md` | Operating instructions (rules, priorities, behavioral guidelines) |
+| `SOUL.md` | Agent persona (tone, communication boundaries) |
+| `USER.md` | User preferences (language, format, interests) |
+| `IDENTITY.md` | Agent identity (name, vibe, emoji) |
+| `TOOLS.md` | Tools documentation (available skills and conventions) |
+| `MEMORY.md` | Freeform notes and memories |
 
-1. **Identity extraction** — The proxy extracts `actorId` from each request using three sources in priority order: (1) `x-openclaw-actor-id` header, (2) OpenAI `user` field in the request body, (3) fallback to `"default-user"`. Channel-prefixed IDs like `telegram:6087229962` are namespaced by replacing colons with underscores (e.g., `telegram_6087229962`). Users sharing the `default-user` fallback would share the same memory namespace.
-2. **Memory retrieval** — Before each Bedrock call, the proxy queries `RetrieveMemoryRecords` with the user's latest message as a semantic search query, scoped to that user's namespace. Up to 5 relevant records (hardcoded `MEMORY_RETRIEVAL_LIMIT`) are filtered and appended to the system prompt under a `## Relevant memories about this user` heading. The model is instructed to use them for personalization without mentioning memory unless asked.
-3. **Event storage** — After each response, the user/assistant exchange (both roles in a single event) is stored via `CreateEvent` (fire-and-forget, non-blocking). Events include the session ID for grouping.
-4. **Memory extraction** — Every 10 minutes (plus 30 seconds after startup), the proxy triggers `StartMemoryExtractionJob`. This is a **global operation** that processes accumulated events across all user namespaces through 3 configured strategies:
-   - **Semantic** (`openclaw_semantic`) — extracts factual information and topics
-   - **User preference** (`openclaw_user_prefs`) — captures user preferences and patterns
-   - **Summary** (`openclaw_summary`) — produces conversation summaries
-
-   Extraction runs server-side using a dedicated `MemoryExecutionRole` with `bedrock:InvokeModel` permissions. New events are not searchable until the next extraction job runs.
-5. **Persistence** — Memories survive container restarts because they are stored server-side in AgentCore Memory, not in the container's process memory. Raw conversation events expire after **90 days** (`event_expiry_duration`). The in-memory `sessionMap` (which generates stable session IDs per `actorId:channel` pair) is lost on restart, but this only affects session ID continuity — not memory records.
-
-**Graceful degradation** — All memory operations (retrieval, storage, extraction) are wrapped in try/catch — they log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is not set, every memory function short-circuits immediately and memory is completely disabled.
+Files are stored at `s3://{bucket}/{namespace}/{filename}` where namespace is derived from the user's channel identity (e.g., `telegram_6087229962`). All 6 files are read from S3 in parallel and injected into the system prompt on every request. Content is sanitized (code fence escaping, 4096 chars per file, 20,000 chars total cap) to prevent prompt injection.
 
 ### Token Usage Tracking
 

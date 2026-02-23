@@ -9,8 +9,6 @@ per user session).
 Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime,
 replacing Fargate. The container runs OpenClaw (Telegram/Discord/Slack),
 a Bedrock proxy, and an AgentCore contract server on port 8080.
-
-Also provisions AgentCore Memory for conversation persistence.
 """
 
 from aws_cdk import (
