@@ -11,7 +11,8 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Di
 - **Infrastructure**: CDK v2 (Python), 6 stacks
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode)
 - **Messaging**: OpenClaw (Node.js) — Telegram, Discord, Slack channel providers
-- **Tools & Skills**: Built-in tool groups (full profile) + 10 ClawHub skills (web search, research, memory, etc.)
+- **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills + 1 custom S3 user files skill
+- **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **AI Model**: Claude Sonnet 4.6 via Bedrock ConverseStream (`au.anthropic.claude-sonnet-4-6`)
 - **Identity**: Cognito User Pool (HMAC-derived passwords, auto-provisioned users)
 - **Memory**: AgentCore Memory (semantic, user_preference, summary strategies) — integrated into proxy for per-user persistent context
@@ -44,6 +45,12 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Di
     |   summary strategies) |      Extraction every 10 min
     +-----------------------+
 
+    +-----------------------+
+    |  S3 User Files        |  <-- Per-user file storage
+    |  s3://bucket/         |      Namespaced by actorId
+    |  {namespace}/file.md  |      Via s3-user-files skill
+    +-----------------------+
+
     Supporting: VPC, KMS, Secrets Manager, Cognito,
                CloudWatch, DynamoDB, CloudTrail
 ```
@@ -67,8 +74,14 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup orchestration (5 steps)
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
-    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Memory integration
+    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Memory + Identity
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
+    skills/
+      s3-user-files/              # Custom per-user file storage skill (S3-backed)
+        SKILL.md                  # OpenClaw skill manifest
+        common.js                 # Shared utilities (sanitize, buildKey, validation)
+        read.js / write.js        # Read/write files in user's S3 namespace
+        list.js / delete.js       # List/delete files in user's S3 namespace
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     keepalive/index.py            # Runtime keepalive invoker
@@ -102,7 +115,7 @@ cdk destroy --all                            # tear down
 ### Build & Push Bridge Image
 ```bash
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2
+export CDK_DEFAULT_REGION=ap-southeast-2
 
 docker build --platform linux/arm64 -t openclaw-bridge bridge/
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
@@ -133,6 +146,30 @@ aws secretsmanager update-secret \
   --secret-id openclaw/channels/slack \
   --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","appToken":"xapp-YOUR-APP-TOKEN"}' \
   --region $CDK_DEFAULT_REGION
+```
+
+### Deploy New Proxy Version
+```bash
+# 1. Bump IMAGE_VERSION in stacks/agentcore_stack.py
+# 2. Build + push
+docker build --platform linux/arm64 -t openclaw-bridge bridge/
+docker tag openclaw-bridge:latest 657117630614.dkr.ecr.ap-southeast-2.amazonaws.com/openclaw-bridge:latest
+docker push 657117630614.dkr.ecr.ap-southeast-2.amazonaws.com/openclaw-bridge:latest
+# 3. CDK deploy
+source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval never
+# 4. Stop old session (REQUIRED — existing session keeps old image)
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id "openclaw-telegram-session-primary-keepalive-001" \
+  --agent-runtime-arn "arn:aws:bedrock-agentcore:ap-southeast-2:657117630614:runtime/openclaw_agent-4AglMQ9ED4" \
+  --qualifier "openclaw_agent_live" --region ap-southeast-2
+# 5. Invoke keepalive to start new session, wait ~4 min for OpenClaw startup
+aws lambda invoke --function-name openclaw-keepalive --payload '{}' --region ap-southeast-2 /tmp/status.json
+```
+
+### Bridge Tests
+```bash
+cd bridge && node --test proxy-identity.test.js       # 24 identity extraction tests
+cd bridge/skills/s3-user-files && AWS_REGION=ap-southeast-2 node --test common.test.js  # 22 S3 skill tests
 ```
 
 ### Runtime Operations
@@ -169,6 +206,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 | `daily_token_budget` | `1000000` | Token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Cost budget alarm threshold |
 | `token_ttl_days` | `90` | DynamoDB TTL |
+| `user_files_ttl_days` | `365` | S3 per-user file expiration |
 
 ## Container Startup Sequence (entrypoint.sh)
 
@@ -188,6 +226,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 - **Keepalive**: Lambda invokes runtime every 5 min; contract server returns `HealthyBusy` to prevent idle termination
 - **Memory event expiry**: `event_expiry_duration` is in days (max 365), not seconds
 - **VPC endpoints**: `bedrock-agentcore-runtime` endpoint not available in all regions — omit if unsupported
+- **Endpoint version drift**: `CfnRuntimeEndpoint` must set `agent_runtime_version=self.runtime.attr_agent_runtime_version` to stay in sync with runtime version on each deploy. Without this, the endpoint stays on an old version after runtime updates, causing misleading "execution role cannot be assumed" errors. Fix: `aws bedrock-agentcore-control update-agent-runtime-endpoint --agent-runtime-version <N>`
 
 ### IAM / Bedrock
 - **Cross-region inference**: Model `au.anthropic.claude-sonnet-4-6` routes to any AU/APAC region — IAM uses `arn:aws:bedrock:*::foundation-model/*`
@@ -223,10 +262,29 @@ aws bedrock-agentcore invoke-agent-runtime \
 
 ### AgentCore Memory Integration
 - **Per-user isolation**: Each user's memories are namespaced by `actorId` (colons replaced with underscores, e.g., `telegram_6087229962`)
-- **Request flow**: Before each Bedrock call, the proxy retrieves up to 5 relevant memory records via `RetrieveMemoryRecords` and appends them to the system prompt. After the response, the user/assistant exchange is stored as a memory event via `CreateEvent` (fire-and-forget)
-- **Memory extraction**: A timer triggers `StartMemoryExtractionJob` every 10 minutes (+ 30s after startup) so the 3 configured strategies (semantic, user_preference, summary) process accumulated events into retrievable records
-- **Graceful degradation**: All memory operations log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is empty, memory is completely disabled
+- **Identity resolution**: `actorId` is extracted in priority order: (1) `x-openclaw-actor-id` header, (2) OpenAI `user` field, (3) OpenClaw message envelope parsing (3 formats, checked in reverse message order): **Format C** (metadata JSON with `sender` field — highest priority, contains platform user IDs) > **Format A** (`System: [TIMESTAMP] Channel TYPE from SenderName:` — display-name fallback) > **Format B** (`[Channel ... id:ID]` — legacy). Format C auto-detects channel from sender ID pattern: `/^[UW][A-Z0-9]{8,}$/i` → Slack, `/^\d{15,}$/` → Discord, `/^\d{5,14}$/` → Telegram. (4) message `name` field, (5) fallback `"default-user"`. All extracted IDs validated against `VALID_ACTOR_ID` regex
+- **Request flow**: Before each Bedrock call, the proxy retrieves up to 5 relevant memory records via `RetrieveMemoryRecords` (hardcoded `MEMORY_RETRIEVAL_LIMIT = 5` in `agentcore-proxy.js`) using the user's latest message as a semantic search query. Records are filtered (`r.content && r.content.text`) and appended to the system prompt under a `## Relevant memories about this user` heading with instructions not to mention memory unless asked. After the response, the user/assistant exchange (both `USER` and `ASSISTANT` roles) is stored as a memory event via `CreateEvent` (fire-and-forget)
+- **Memory extraction**: A timer triggers `StartMemoryExtractionJob` every 10 minutes (+ 30s after startup). This is a **global operation** — it processes accumulated events across all user namespaces, not per-user. The 3 configured strategies (semantic, user_preference, summary) run server-side using a dedicated `MemoryExecutionRole` with `bedrock:InvokeModel` permissions
+- **Event expiry**: Raw conversation events expire after 90 days (`event_expiry_duration=90` in `agentcore_stack.py`). Extracted memory records (the output of strategies) persist independently
+- **Graceful degradation**: All memory operations (retrieval, storage, extraction) are wrapped in try/catch — they log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is empty, every memory function short-circuits immediately
+- **Session ID generation**: Session IDs are generated per `actorId:channel` pair as `ses-{timestamp}-{random}-{md5hash}` and cached in-memory (`sessionMap`). AgentCore requires minimum 33 characters. Session IDs are lost on container restart but this only affects session continuity metadata, not memory records
 - **SDK**: Uses `@aws-sdk/client-bedrock-agentcore` (`BedrockAgentCoreClient`)
 - **Namespace character restrictions**: `actorId` contains colons (e.g., `telegram:6087229962`) which may be rejected by the namespace field — proxy replaces `:` with `_`
 - **Added latency**: Memory retrieval adds ~50-200ms per request
-- **Container restart**: Memories persist across container restarts since they are stored in AgentCore Memory (server-side), not in-memory
+- **Container restart**: Memories persist across container restarts since they are stored in AgentCore Memory (server-side), not in-memory. The in-memory `sessionMap` is lost, generating new session IDs, but this has no effect on memory retrieval
+
+### Per-User File Isolation
+- **S3-backed isolation**: User files stored in `s3://openclaw-user-files-{account}-{region}/{namespace}/{filename}` where `namespace = actorId.replace(/:/g, "_")`
+- **System prompt injection**: `buildUserIdentityContext()` in `agentcore-proxy.js` ALWAYS injects `actorId`, `namespace`, and isolation rules into the system prompt (not conditional on memory)
+- **S3 skill**: Custom `s3-user-files` skill provides `read.js`, `write.js`, `list.js`, `delete.js` — all namespaced by user_id argument
+- **NODE_PATH**: Set to `/app/node_modules` in Dockerfile so skill scripts can resolve `@aws-sdk/client-s3`
+- **openclaw-mem removed**: The shared SQLite-based `openclaw-mem` ClawHub skill was replaced by AgentCore Memory (per-user) + S3 skill (per-user files)
+- **Content as CLI argument**: `write.js` receives content via `process.argv.slice(4).join(" ")` — works for typical .md files but may truncate very large content passed as shell arguments
+- **default-user rejection**: `write.js` and other S3 scripts reject `default_user`/`default-user` to prevent accidental shared-namespace writes
+- **IDENTITY.md pre-loading**: Proxy reads user's IDENTITY.md from S3 at request time and injects content into system prompt — prevents LLM from reading wrong namespace via tool calls
+- **System prompt sanitization**: IDENTITY.md content is truncated to 4096 chars and triple-backticks replaced with `~~~` to prevent code fence escape / prompt injection
+- **Channel validation**: Channel value validated against allowlist (`telegram`, `slack`, `discord`, `whatsapp`, `unknown`) before system prompt injection
+- **Namespace immutability**: System prompt includes "Namespace Protection (IMMUTABLE)" section — namespace is system-determined, users can change display name but not actorId/namespace
+- **S3 bucket encryption**: Uses project CMK (not AWS-managed key). When switching encryption keys, existing objects must be re-encrypted in-place via `aws s3 cp --sse aws:kms --sse-kms-key-id CMK_ARN`
+- **No PII in diagnostics**: `/health` endpoint only exposes `actorId`, `channel`, `idSource`, `msgCount`, `toolCount`, `timestamp` — no user message content
+- **AWS_REGION required**: Proxy, S3 skill scripts, and entrypoint.sh all fail fast if `AWS_REGION` is not set — no silent fallback to a wrong region
