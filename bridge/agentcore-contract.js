@@ -146,7 +146,6 @@ function writeOpenClawConfig() {
     agents: {
       defaults: {
         model: { primary: "agentcore/bedrock-agentcore" },
-        heartbeat: { every: false },  // Disabled — EventBridge replaces internal scheduler
       },
     },
     tools: {
@@ -285,7 +284,6 @@ async function lazyInit(userId, actorId, channel) {
         String(OPENCLAW_PORT),
         "--bind",
         "lan",
-        "--allow-unconfigured",
         "--verbose",
       ],
       { stdio: "inherit" },
