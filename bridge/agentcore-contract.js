@@ -786,10 +786,8 @@ const server = http.createServer(async (req, res) => {
           }
           // Trigger init in background if not already running
           if (!initInProgress && userId && actorId) {
-            lazyInit(userId, actorId, channel || "unknown").catch((err) => {
-              console.error(
-                `[contract] Warmup lazy init failed: ${err.message}`,
-              );
+            init(userId, actorId, channel || "unknown").catch((err) => {
+              console.error(`[contract] Warmup init failed: ${err.message}`);
             });
           }
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -812,7 +810,7 @@ const server = http.createServer(async (req, res) => {
           if (!openclawReady || !proxyReady) {
             try {
               if (!initInProgress) {
-                await lazyInit(userId, actorId, channel || "unknown");
+                await init(userId, actorId, channel || "unknown");
               } else {
                 await initPromise;
               }
