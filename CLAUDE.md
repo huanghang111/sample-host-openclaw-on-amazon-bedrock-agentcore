@@ -229,6 +229,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
+| `registration_open` | `false` | If true, any user can register. If false, only allowlisted users |
 
 ## Container Startup Sequence
 
@@ -255,8 +256,26 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `USER#user_abc123` | `CHANNEL#telegram:6087229962` | User's bound channels |
 | `USER#user_abc123` | `SESSION` | Current session |
 | `BIND#ABC123` | `BIND` | Cross-channel bind code (10 min TTL) |
+| `ALLOW#telegram:6087229962` | `ALLOW` | User allowlist entry |
 
 **Cross-channel binding**: User says "link accounts" on Telegram → gets 6-char code → enters code on Slack → both channels route to same user/session.
+
+### User Allowlist
+
+When `registration_open` is `false` (default), only users with an `ALLOW#` record in DynamoDB can register. Existing users (already have a `CHANNEL#` record) are always allowed. Cross-channel binding bypasses the allowlist since it links to an already-approved user.
+
+```bash
+# Add a user to the allowlist
+./scripts/manage-allowlist.sh add telegram:123456
+
+# Remove a user
+./scripts/manage-allowlist.sh remove telegram:123456
+
+# List all allowed users
+./scripts/manage-allowlist.sh list
+```
+
+Only the **first channel identity** needs to be allowlisted. When a user binds a second channel (e.g. Slack) via `link`, the new channel maps to their existing approved user — no separate allowlist entry needed.
 
 ## Gotchas
 
