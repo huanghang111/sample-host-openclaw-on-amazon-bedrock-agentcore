@@ -321,14 +321,16 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
    - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
    - Restore `.openclaw/` from S3 via `workspace-sync.js`
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Write headless OpenClaw config (no channels)
-   - Start OpenClaw gateway (port 18789) — ~4 min startup
-   - Start periodic workspace saves (every 5 min)
-4. **`action: warmup`**: Triggers lazy init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
-5. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
-6. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
-7. **Subsequent `/invocations` with `action: chat`**: Bridge message via WebSocket to OpenClaw
-8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
+   - Start OpenClaw gateway (port 18789) in background
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Wait for proxy only (~5s)
+5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools)
+6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+7. **After handoff**: Full OpenClaw features — `web_fetch` (no API key needed), `web_search` (needs Brave API key), 8 ClawHub skills (DuckDuckGo search, Jina reader, etc.), sub-agent support, session management
+8. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
+9. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
+10. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
+11. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
 
@@ -423,18 +425,20 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 
 ### OpenClaw
 - Startup takes ~2-4 minutes (plugin registration); lightweight agent shim handles messages during this time
-- Correct start command: `openclaw gateway run --port 18789 --bind lan --verbose`
+- Correct start command: `openclaw gateway run --port 18789 --verbose` (no `--bind lan` — localhost binding sufficient since both processes run in the same container)
 - **Tool profile**: Uses `"full"` profile with a deny list. Do NOT use `"basic"` (undocumented, may disable web tools). Documented profiles: `minimal`, `coding`, `messaging`, `full`
 - **Deny list**: `["write", "edit", "apply_patch", "browser", "canvas", "cron", "gateway"]` — local writes use S3 skill, no browser/UI in container, EventBridge replaces built-in cron
 - **Sub-agent sandbox**: Must be `"off"` — no Docker inside AgentCore microVMs. MicroVMs already provide per-user isolation
 - **Sub-agent model**: Configurable via `SUBAGENT_MODEL` env var (from `subagent_model_id` in cdk.json). Empty = use same as main model
+- **`skipBootstrap` removed**: No longer a valid config key — OpenClaw rejects unknown keys and exits with code 1
 - **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
 - **ClawHub skill paths**: `clawhub install` installs to managed skills path — OpenClaw scans this automatically. Custom skills in `/skills/` loaded via `extraDirs`
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--no-input --force` for non-interactive Docker builds
 - **8 ClawHub skills installed**: duckduckgo-search, jina-reader, deep-research-pro, telegram-compose, transcript, hackernews, news-feed, task-decomposer
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
 - **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
-- **OpenClaw 2026.2.23 breaking change**: Non-loopback `controlUi` requires `dangerouslyAllowHostHeaderOriginFallback: true` or explicit `allowedOrigins`. Without this, `openclaw gateway run --bind lan` fails with `Error: non-loopback Control UI requires gateway.controlUi.allowedOrigins`
+- **OpenClaw 2026.2.23 breaking change**: Non-loopback bindings require `controlUi.allowedOrigins` or `dangerouslyAllowHostHeaderOriginFallback`. Solution: use localhost binding (no `--bind lan`), set `controlUi: { enabled: false, allowInsecureAuth: true, dangerouslyDisableDeviceAuth: true }`. The `dangerouslyDisableDeviceAuth` is needed for WebSocket auth without HTTPS
+- **Workspace sync overwrites config**: The `.openclaw/` S3 sync can overwrite `openclaw.json` with stale configs. `openclaw.json` is excluded from sync via SKIP_PATTERNS — config is always programmatically generated by `writeOpenClawConfig()`
 
 ### Cognito Identity
 - Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`

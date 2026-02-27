@@ -55,6 +55,12 @@ let initPromise = null;
 let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
+const BUILD_VERSION = "v24"; // Bump in cdk.json to force container redeploy
+
+// OpenClaw process diagnostics (last N lines of stdout/stderr)
+const OPENCLAW_LOG_LIMIT = 50;
+let openclawLogs = [];
+let openclawExitCode = null;
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
@@ -221,17 +227,14 @@ function writeOpenClawConfig() {
     gateway: {
       mode: "local",
       port: OPENCLAW_PORT,
-      bind: "lan",
-      trustedProxies: ["0.0.0.0/0"],
+      trustedProxies: ["127.0.0.1"],
       auth: { mode: "token", token: GATEWAY_TOKEN },
       controlUi: {
-        enabled: true,
+        enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
-        dangerouslyAllowHostHeaderOriginFallback: true,
       },
     },
-    skipBootstrap: true,
     channels: {}, // No channels — messages bridged via WebSocket
   };
 
@@ -414,19 +417,30 @@ async function init(userId, actorId, channel) {
     process.env.OPENCLAW_SKIP_CRON = "1";
     openclawProcess = spawn(
       "openclaw",
-      [
-        "gateway",
-        "run",
-        "--port",
-        String(OPENCLAW_PORT),
-        "--bind",
-        "lan",
-        "--verbose",
-      ],
-      { stdio: "inherit" },
+      ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
+      { stdio: ["ignore", "pipe", "pipe"] },
     );
+    // Capture OpenClaw stdout/stderr for diagnostics
+    const captureLog = (stream, label) => {
+      let buf = "";
+      stream.on("data", (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop(); // keep incomplete line in buffer
+        for (const line of lines) {
+          if (line.trim()) {
+            console.log(`[openclaw:${label}] ${line}`);
+            openclawLogs.push(`[${label}] ${line}`);
+            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
+          }
+        }
+      });
+    };
+    captureLog(openclawProcess.stdout, "out");
+    captureLog(openclawProcess.stderr, "err");
     openclawProcess.on("exit", (code) => {
       console.log(`[contract] OpenClaw exited with code ${code}`);
+      openclawExitCode = code;
       openclawReady = false;
     });
 
@@ -812,17 +826,19 @@ const server = http.createServer(async (req, res) => {
 
         // Status check (no init needed)
         if (action === "status") {
+          const diag = {
+            buildVersion: BUILD_VERSION,
+            uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+            currentUserId,
+            openclawReady,
+            proxyReady,
+            secretsReady,
+            openclawExitCode,
+            openclawPid: openclawProcess?.pid || null,
+            openclawLogs: openclawLogs.slice(-20),
+          };
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              status: "running",
-              uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-              currentUserId,
-              openclawReady,
-              proxyReady,
-              secretsReady,
-            }),
-          );
+          res.end(JSON.stringify({ response: JSON.stringify(diag) }));
           return;
         }
 

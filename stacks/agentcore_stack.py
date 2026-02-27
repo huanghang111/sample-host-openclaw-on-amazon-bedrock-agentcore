@@ -189,6 +189,7 @@ class AgentCoreStack(Stack):
         # --- Default Bedrock model ID -----------------------------------------
         default_model_id = self.node.try_get_context("default_model_id") or "global.anthropic.claude-opus-4-6-v1"
         subagent_model_id = self.node.try_get_context("subagent_model_id") or ""
+        image_version = str(self.node.try_get_context("image_version") or "1")
 
         # --- AgentCore Runtime (hosts OpenClaw container) ---------------------
         self.runtime = agentcore.CfnRuntime(
@@ -197,7 +198,7 @@ class AgentCoreStack(Stack):
             agent_runtime_name="openclaw_agent",
             agent_runtime_artifact=agentcore.CfnRuntime.AgentRuntimeArtifactProperty(
                 container_configuration=agentcore.CfnRuntime.ContainerConfigurationProperty(
-                    container_uri=f"{account}.dkr.ecr.{region}.amazonaws.com/openclaw-bridge:latest"
+                    container_uri=f"{account}.dkr.ecr.{region}.amazonaws.com/openclaw-bridge:v{image_version}"
                 )
             ),
             network_configuration=agentcore.CfnRuntime.NetworkConfigurationProperty(
@@ -219,9 +220,7 @@ class AgentCoreStack(Stack):
                 "WORKSPACE_SYNC_INTERVAL_MS": str(
                     int(self.node.try_get_context("workspace_sync_interval_seconds") or "300") * 1000
                 ),
-                "IMAGE_VERSION": str(
-                    self.node.try_get_context("image_version") or "1"
-                ),  # bump in cdk.json to force container redeploy
+                "IMAGE_VERSION": image_version,  # bump in cdk.json to force container redeploy
                 # EventBridge cron scheduling — deterministic names to avoid circular deps
                 "EVENTBRIDGE_SCHEDULE_GROUP": "openclaw-cron",
                 "CRON_LAMBDA_ARN": f"arn:aws:lambda:{region}:{account}:function:openclaw-cron-executor",
