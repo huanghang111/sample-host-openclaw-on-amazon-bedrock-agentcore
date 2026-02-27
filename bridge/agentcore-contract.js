@@ -3,16 +3,16 @@
  *
  * Implements the required HTTP protocol contract for AgentCore Runtime:
  *   - GET  /ping         -> Health check (Healthy — allows idle termination)
- *   - POST /invocations  -> Chat handler with lazy init per user
+ *   - POST /invocations  -> Chat handler with hybrid init
  *
  * Each AgentCore session is dedicated to a single user. On first invocation:
- *   1. Restore .openclaw/ workspace from S3
- *   2. Start the Bedrock proxy (port 18790) with USER_ID/CHANNEL env vars
- *   3. Start OpenClaw gateway (port 18789) in headless mode (no channels)
- *   4. Wait for OpenClaw to become ready (~4 min)
- *   5. Start periodic workspace saves
+ *   1. Use pre-fetched secrets (fetched eagerly at boot)
+ *   2. Start proxy + OpenClaw + workspace restore in parallel
+ *   3. Once proxy is ready (~5s), route via lightweight agent shim
+ *   4. Once OpenClaw is ready (~2-4 min), route via WebSocket bridge
  *
- * Subsequent invocations bridge messages to OpenClaw via WebSocket.
+ * The lightweight agent handles messages immediately while OpenClaw starts.
+ * Once OpenClaw is ready, all subsequent messages route through it seamlessly.
  *
  * Runs on port 8080 (required by AgentCore Runtime).
  */
@@ -25,16 +25,17 @@ const {
   GetSecretValueCommand,
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
+const agent = require("./lightweight-agent");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
 
-// Gateway token — fetched from Secrets Manager during lazy init.
+// Gateway token — fetched from Secrets Manager eagerly at boot.
 // No fallback — container will fail to authenticate WebSocket if not set.
 let GATEWAY_TOKEN = null;
 
-// Cognito password secret — fetched from Secrets Manager during lazy init.
+// Cognito password secret — fetched from Secrets Manager eagerly at boot.
 // Stored in-process only, never written to process.env.
 let COGNITO_PASSWORD_SECRET = null;
 
@@ -48,14 +49,97 @@ let openclawProcess = null;
 let proxyProcess = null;
 let openclawReady = false;
 let proxyReady = false;
+let secretsReady = false;
 let initInProgress = false;
 let initPromise = null;
+let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
+const BUILD_VERSION = "v30"; // Bump in cdk.json to force container redeploy
 
-// Message queue for serializing concurrent requests
+// OpenClaw process diagnostics (last N lines of stdout/stderr)
+const OPENCLAW_LOG_LIMIT = 50;
+let openclawLogs = [];
+let openclawExitCode = null;
+
+// Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
 let processingMessage = false;
+
+/**
+ * Pre-fetch secrets from Secrets Manager at container boot.
+ * Runs in the background — does not block /ping health checks.
+ */
+async function prefetchSecrets() {
+  const region = process.env.AWS_REGION || "us-west-2";
+  const smClient = new SecretsManagerClient({ region });
+
+  const gatewaySecretId = process.env.GATEWAY_TOKEN_SECRET_ID;
+  if (gatewaySecretId) {
+    const resp = await smClient.send(
+      new GetSecretValueCommand({ SecretId: gatewaySecretId }),
+    );
+    if (resp.SecretString) {
+      GATEWAY_TOKEN = resp.SecretString;
+      console.log("[contract] Gateway token pre-fetched from Secrets Manager");
+    }
+  }
+
+  const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
+  if (cognitoSecretId) {
+    const resp = await smClient.send(
+      new GetSecretValueCommand({ SecretId: cognitoSecretId }),
+    );
+    if (resp.SecretString) {
+      COGNITO_PASSWORD_SECRET = resp.SecretString;
+      console.log("[contract] Cognito password secret pre-fetched");
+    }
+  }
+
+  secretsReady = true;
+  console.log("[contract] Secrets pre-fetch complete");
+}
+
+/**
+ * Clean up stale .lock files in the .openclaw directory (async, non-blocking).
+ * Prevents "session file locked" errors after workspace restore from S3.
+ */
+async function cleanupLockFiles() {
+  const fs = require("fs");
+  const path = require("path");
+  const homeDir = process.env.HOME || "/root";
+  const openclawDir = path.join(homeDir, ".openclaw");
+
+  try {
+    await fs.promises.access(openclawDir);
+  } catch {
+    return; // Directory doesn't exist yet — nothing to clean
+  }
+
+  async function walkAndClean(dir) {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const tasks = [];
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        tasks.push(walkAndClean(fullPath));
+      } else if (entry.name.endsWith(".lock")) {
+        tasks.push(
+          fs.promises.unlink(fullPath).catch(() => {}),
+        );
+      }
+    }
+    await Promise.all(tasks);
+  }
+
+  await walkAndClean(openclawDir);
+  console.log("[contract] Lock file cleanup complete (async)");
+}
 
 /**
  * Check if the proxy health endpoint responds.
@@ -78,6 +162,48 @@ function checkProxyHealth() {
       req.destroy();
       resolve(null);
     });
+  });
+}
+
+/**
+ * Send a lightweight request to the proxy to trigger JIT compilation
+ * of the request handling path. Makes the first real user message faster.
+ */
+function warmProxyJit() {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({
+      model: "bedrock-agentcore",
+      messages: [{ role: "user", content: "warmup" }],
+      max_tokens: 1,
+      stream: false,
+    });
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: PROXY_PORT,
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => {
+          console.log("[contract] Proxy JIT warm-up complete");
+          resolve();
+        });
+      },
+    );
+    req.on("error", () => resolve());
+    req.on("timeout", () => {
+      req.destroy();
+      resolve();
+    });
+    req.write(payload);
+    req.end();
   });
 }
 
@@ -129,9 +255,17 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
 
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
+ * Full tool profile with deny list for unsafe/irrelevant tools.
+ * Sub-agents enabled for deep-research-pro and task-decomposer skills.
+ * Sandbox disabled — AgentCore microVMs provide per-user isolation.
  */
 function writeOpenClawConfig() {
   const fs = require("fs");
+
+  // Sub-agent model: defaults to main model, configurable via SUBAGENT_MODEL env var
+  const subagentModel =
+    process.env.SUBAGENT_MODEL || "agentcore/bedrock-agentcore";
+
   const config = {
     models: {
       providers: {
@@ -146,27 +280,42 @@ function writeOpenClawConfig() {
     agents: {
       defaults: {
         model: { primary: "agentcore/bedrock-agentcore" },
+        subagents: {
+          model: subagentModel,
+          maxConcurrent: 2,
+          runTimeoutSeconds: 900,
+          archiveAfterMinutes: 60,
+        },
+        sandbox: {
+          mode: "off", // No Docker in AgentCore container; microVMs provide isolation
+        },
       },
     },
     tools: {
       profile: "full",
-      deny: ["write", "edit", "apply_patch"],
+      deny: [
+        "write", // Local writes don't persist — use S3 skill instead
+        "edit", // Local edits are ephemeral — use S3 skill instead
+        "apply_patch", // Code patching not needed for chat assistant
+        "browser", // No headless browser in ARM64 container
+        "canvas", // No UI rendering in headless chat context
+        "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
+        "gateway", // Admin tool — not needed for end users
+      ],
     },
     skills: {
-      allowBundled: ["*"],
+      allowBundled: [],
       load: { extraDirs: ["/skills"] },
     },
     gateway: {
       mode: "local",
       port: OPENCLAW_PORT,
-      bind: "lan",
-      trustedProxies: ["0.0.0.0/0"],
+      trustedProxies: ["127.0.0.1"],
       auth: { mode: "token", token: GATEWAY_TOKEN },
       controlUi: {
-        enabled: true,
+        enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
-        dangerouslyAllowHostHeaderOriginFallback: true,
       },
     },
     channels: {}, // No channels — messages bridged via WebSocket
@@ -190,6 +339,15 @@ function writeOpenClawConfig() {
         "# Agent Instructions",
         "",
         "You are a helpful AI assistant running in a per-user container on AWS.",
+        "You have built-in web tools, file storage, scheduling, and many community skills.",
+        "",
+        "## Built-in Web Tools",
+        "",
+        "You have built-in **web_search** and **web_fetch** tools:",
+        "- **web_search**: Search the web for current information",
+        "- **web_fetch**: Fetch and read web page content as markdown",
+        "",
+        "Use these for real-time information, news, research, and reading web pages.",
         "",
         "## Scheduling & Cron Jobs",
         "",
@@ -207,6 +365,20 @@ function writeOpenClawConfig() {
         "",
         "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
         "",
+        "## Community Skills (ClawHub)",
+        "",
+        "The following community skills are pre-installed:",
+        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
+        "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
+        "- **telegram-compose**: Rich HTML formatting for Telegram messages",
+        "- **transcript**: YouTube video transcript extraction",
+        "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
+        "",
+        "## Sub-agents",
+        "",
+        "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
+        "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
+        "",
       ].join("\n"),
     );
     console.log("[contract] AGENTS.md written");
@@ -214,10 +386,33 @@ function writeOpenClawConfig() {
 }
 
 /**
- * Lazy initialization — called on first /invocations request.
- * Restores workspace, starts proxy and OpenClaw, waits for readiness.
+ * Poll for OpenClaw readiness in the background.
+ * Sets openclawReady=true and starts workspace saves when ready.
  */
-async function lazyInit(userId, actorId, channel) {
+async function pollOpenClawReadiness(namespace) {
+  const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
+  if (ready) {
+    openclawReady = true;
+    workspaceSync.startPeriodicSave(namespace);
+    console.log(
+      "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
+    );
+  } else {
+    console.error(
+      "[contract] OpenClaw failed to start — lightweight agent will continue handling messages",
+    );
+  }
+}
+
+/**
+ * Initialization — called on first /invocations request.
+ *
+ * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
+ * in parallel. Only waits for proxy readiness (~5s), then returns.
+ * OpenClaw readiness is polled in the background.
+ */
+async function init(userId, actorId, channel) {
+  if (proxyReady) return; // Already initialized
   if (initInProgress) return initPromise;
   initInProgress = true;
 
@@ -227,70 +422,33 @@ async function lazyInit(userId, actorId, channel) {
     currentNamespace = namespace;
 
     console.log(
-      `[contract] Lazy init for user=${userId} actor=${actorId} namespace=${namespace}`,
+      `[contract] Init for user=${userId} actor=${actorId} namespace=${namespace}`,
     );
 
-    // 0. Fetch secrets from Secrets Manager
-    try {
-      const region = process.env.AWS_REGION || "us-west-2";
-      const smClient = new SecretsManagerClient({ region });
-
-      const gatewaySecretId = process.env.GATEWAY_TOKEN_SECRET_ID;
-      if (gatewaySecretId) {
-        const resp = await smClient.send(
-          new GetSecretValueCommand({ SecretId: gatewaySecretId }),
-        );
-        if (resp.SecretString) {
-          GATEWAY_TOKEN = resp.SecretString;
-          console.log("[contract] Gateway token loaded from Secrets Manager");
-        }
-      }
-      if (!GATEWAY_TOKEN) {
-        throw new Error(
-          "Gateway token not available — cannot authenticate WebSocket connections",
-        );
-      }
-
-      const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
-      if (cognitoSecretId) {
-        const resp = await smClient.send(
-          new GetSecretValueCommand({ SecretId: cognitoSecretId }),
-        );
-        if (resp.SecretString) {
-          COGNITO_PASSWORD_SECRET = resp.SecretString;
-          console.log("[contract] Cognito password secret loaded");
-        }
-      }
-    } catch (err) {
-      console.error(`[contract] Secrets fetch failed: ${err.message}`);
-      throw err; // Abort init — secrets are required for operation
+    // 0. Wait for pre-fetched secrets (should already be done by now)
+    if (!secretsReady && secretsPrefetchPromise) {
+      console.log("[contract] Waiting for secrets pre-fetch to complete...");
+      await secretsPrefetchPromise;
     }
 
-    // 1. Restore .openclaw/ from S3
-    try {
-      await workspaceSync.restoreWorkspace(namespace);
-    } catch (err) {
-      console.warn(`[contract] Workspace restore failed: ${err.message}`);
+    // Retry secrets fetch inline if pre-fetch failed (transient error recovery)
+    if (!GATEWAY_TOKEN) {
+      console.log(
+        "[contract] Gateway token missing — retrying secrets fetch...",
+      );
+      await prefetchSecrets();
+    }
+    if (!GATEWAY_TOKEN) {
+      throw new Error(
+        "Gateway token not available — cannot authenticate WebSocket connections",
+      );
     }
 
-    // 1b. Clean up stale lock files restored from S3 (prevents "session file locked" errors)
-    try {
-      const _fs = require("fs");
-      const { execSync } = require("child_process");
-      const _home = process.env.HOME || "/root";
-      const locks = execSync(
-        `find ${_home}/.openclaw -name '*.lock' -type f 2>/dev/null || true`,
-        { encoding: "utf8" },
-      ).trim();
-      if (locks) {
-        for (const lockFile of locks.split("\n").filter(Boolean)) {
-          _fs.unlinkSync(lockFile);
-        }
-        console.log(`[contract] Cleaned up stale lock files`);
-      }
-    } catch (err) {
+    // 1b. Clean up stale lock files restored from S3 (non-blocking)
+    // Runs in parallel with proxy startup — does not block init.
+    const lockCleanupPromise = cleanupLockFiles().catch((err) => {
       console.warn(`[contract] Lock cleanup failed: ${err.message}`);
-    }
+    });
 
     // 2. Start the Bedrock proxy with user identity env vars
     // Only pass required env vars — avoid leaking secrets via process.env spread
@@ -319,43 +477,76 @@ async function lazyInit(userId, actorId, channel) {
       proxyReady = false;
     });
 
-    // Wait for proxy to be ready
-    proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
+    // Wait for lock cleanup to complete before starting OpenClaw
+    await lockCleanupPromise;
 
-    // 3. Write headless OpenClaw config and start gateway
+    // Write OpenClaw config and start gateway (non-blocking)
     writeOpenClawConfig();
     console.log("[contract] Starting OpenClaw gateway (headless)...");
     // Set OPENCLAW_SKIP_CRON in parent env so OpenClaw gateway inherits it
     process.env.OPENCLAW_SKIP_CRON = "1";
     openclawProcess = spawn(
       "openclaw",
-      [
-        "gateway",
-        "run",
-        "--port",
-        String(OPENCLAW_PORT),
-        "--bind",
-        "lan",
-        "--verbose",
-      ],
-      { stdio: "inherit" },
+      ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
+      { stdio: ["ignore", "pipe", "pipe"] },
     );
+    // Capture OpenClaw stdout/stderr for diagnostics
+    const captureLog = (stream, label) => {
+      let buf = "";
+      stream.on("data", (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop(); // keep incomplete line in buffer
+        for (const line of lines) {
+          if (line.trim()) {
+            console.log(`[openclaw:${label}] ${line}`);
+            openclawLogs.push(`[${label}] ${line}`);
+            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
+          }
+        }
+      });
+    };
+    captureLog(openclawProcess.stdout, "out");
+    captureLog(openclawProcess.stderr, "err");
     openclawProcess.on("exit", (code) => {
       console.log(`[contract] OpenClaw exited with code ${code}`);
+      openclawExitCode = code;
       openclawReady = false;
     });
 
-    // 4. Wait for OpenClaw to be ready
-    openclawReady = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
+    // Restore workspace from S3 (non-blocking, needed for OpenClaw)
+    workspaceSync.restoreWorkspace(namespace).catch((err) => {
+      console.warn(`[contract] Workspace restore failed: ${err.message}`);
+    });
 
-    // 5. Start periodic workspace saves
-    workspaceSync.startPeriodicSave(namespace);
+    // 2. Wait only for proxy readiness (~5s)
+    proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
+    if (!proxyReady) {
+      throw new Error("Proxy failed to start within 30s");
+    }
 
-    console.log("[contract] Lazy init complete");
+    // 2b. Warm proxy JIT — send a lightweight request to trigger V8 compilation
+    // of the request handling path, so the first real user message is faster.
+    warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+
+    // 3. Poll for OpenClaw readiness in the background (don't block)
+    pollOpenClawReadiness(namespace).catch((err) => {
+      console.error(
+        `[contract] OpenClaw readiness polling failed: ${err.message}`,
+      );
+    });
+
+    console.log(
+      "[contract] Init complete — proxy ready, lightweight agent active",
+    );
   })();
 
   try {
     await initPromise;
+  } catch (err) {
+    // Reset initPromise on failure so concurrent requests don't await a stale rejected promise
+    initPromise = null;
+    throw err;
   } finally {
     initInProgress = false;
   }
@@ -645,6 +836,29 @@ async function bridgeMessage(message, timeoutMs = 240000) {
 }
 
 /**
+ * Build bridge text from message payload.
+ * Handles structured messages with images and plain text.
+ */
+function buildBridgeText(message) {
+  if (
+    typeof message === "object" &&
+    message !== null &&
+    Array.isArray(message.images)
+  ) {
+    return (
+      (message.text || "") +
+      "\n\n[OPENCLAW_IMAGES:" +
+      JSON.stringify(message.images) +
+      "]"
+    );
+  }
+  if (typeof message === "string") {
+    return message;
+  }
+  return String(message);
+}
+
+/**
  * AgentCore contract HTTP server.
  */
 const server = http.createServer(async (req, res) => {
@@ -684,18 +898,21 @@ const server = http.createServer(async (req, res) => {
         const payload = body ? JSON.parse(body) : {};
         const action = payload.action || "status";
 
-        // Status check (no lazy init needed)
+        // Status check (no init needed)
         if (action === "status") {
+          const diag = {
+            buildVersion: BUILD_VERSION,
+            uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+            currentUserId,
+            openclawReady,
+            proxyReady,
+            secretsReady,
+            openclawExitCode,
+            openclawPid: openclawProcess?.pid || null,
+            openclawLogs: openclawLogs.slice(-20),
+          };
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              status: "running",
-              uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-              currentUserId,
-              openclawReady,
-              proxyReady,
-            }),
-          );
+          res.end(JSON.stringify({ response: JSON.stringify(diag) }));
           return;
         }
 
@@ -709,10 +926,8 @@ const server = http.createServer(async (req, res) => {
           }
           // Trigger init in background if not already running
           if (!initInProgress && userId && actorId) {
-            lazyInit(userId, actorId, channel || "unknown").catch((err) => {
-              console.error(
-                `[contract] Warmup lazy init failed: ${err.message}`,
-              );
+            init(userId, actorId, channel || "unknown").catch((err) => {
+              console.error(`[contract] Warmup init failed: ${err.message}`);
             });
           }
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -735,7 +950,7 @@ const server = http.createServer(async (req, res) => {
           if (!openclawReady || !proxyReady) {
             try {
               if (!initInProgress) {
-                await lazyInit(userId, actorId, channel || "unknown");
+                await init(userId, actorId, channel || "unknown");
               } else {
                 await initPromise;
               }
@@ -793,54 +1008,75 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Kick off lazy init in background (non-blocking) if not ready
-          if (!openclawReady || !proxyReady) {
-            if (!initInProgress) {
-              // Start init in background — don't await
-              lazyInit(userId, actorId, channel || "unknown").catch((err) => {
-                console.error(
-                  `[contract] Background lazy init failed: ${err.message}`,
-                );
-              });
+          // Trigger init if not done yet (blocks until proxy is ready)
+          if (!proxyReady && !initInProgress) {
+            try {
+              await init(userId, actorId, channel || "unknown");
+            } catch (err) {
+              console.error(`[contract] Init failed: ${err.message}`);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  response:
+                    "I'm having trouble starting up. Please try again in a moment.",
+                  userId,
+                  sessionId: payload.sessionId || null,
+                  status: "error",
+                }),
+              );
+              return;
             }
-            // Return immediately so AgentCore doesn't timeout
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                response:
-                  "I'm starting up — this takes a few minutes for the first message. Please try again shortly.",
-                userId,
-                sessionId: payload.sessionId || null,
-                status: "initializing",
-              }),
-            );
-            return;
+          } else if (!proxyReady && initInProgress) {
+            // Init already in progress — wait for it
+            try {
+              await initPromise;
+            } catch (err) {
+              console.error(
+                `[contract] Init (in-progress) failed: ${err.message}`,
+              );
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  response:
+                    "I'm still starting up. Please try again in a moment.",
+                  userId,
+                  sessionId: payload.sessionId || null,
+                  status: "initializing",
+                }),
+              );
+              return;
+            }
           }
 
-          // Build bridge text: structured messages get an image marker appended
-          let bridgeText;
-          if (
-            typeof message === "object" &&
-            message !== null &&
-            Array.isArray(message.images)
-          ) {
-            bridgeText =
-              (message.text || "") +
-              "\n\n[OPENCLAW_IMAGES:" +
-              JSON.stringify(message.images) +
-              "]";
-          } else if (typeof message === "string") {
-            bridgeText = message;
-          } else {
-            bridgeText = String(message);
-          }
+          const bridgeText = buildBridgeText(message);
 
-          // Enqueue message for serial processing (prevents concurrent WebSocket races)
+          // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
           let responseText;
-          try {
-            responseText = await enqueueMessage(bridgeText);
-          } catch (bridgeErr) {
-            responseText = `Bridge error: ${bridgeErr.message}`;
+          if (openclawReady) {
+            // Full OpenClaw path — WebSocket bridge
+            try {
+              responseText = await enqueueMessage(bridgeText);
+            } catch (bridgeErr) {
+              console.error(
+                `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
+              );
+              // Fall back to lightweight agent on bridge failure
+              responseText = await agent.chat(bridgeText, actorId);
+            }
+          } else if (proxyReady) {
+            // Warm-up shim path — lightweight agent via proxy
+            console.log("[contract] Routing via lightweight agent (warm-up)");
+            try {
+              responseText = await agent.chat(bridgeText, actorId);
+            } catch (agentErr) {
+              responseText = `I'm having trouble right now. Please try again in a moment.`;
+              console.error(
+                `[contract] Lightweight agent error: ${agentErr.message}`,
+              );
+            }
+          } else {
+            // Proxy not ready yet (should be rare — init awaits proxy)
+            responseText = "I'm starting up — please try again in a moment.";
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -922,4 +1158,9 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(
     "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
   );
+
+  // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)
+  secretsPrefetchPromise = prefetchSecrets().catch((err) => {
+    console.warn(`[contract] Secret prefetch failed: ${err.message}`);
+  });
 });

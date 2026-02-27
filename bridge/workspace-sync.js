@@ -10,16 +10,31 @@
  * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/)
  */
 
-const { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  ListObjectsV2Command,
+} = require("@aws-sdk/client-s3");
 const fs = require("fs");
 const path = require("path");
 
 const BUCKET = process.env.S3_USER_FILES_BUCKET;
-const LOCAL_PATH = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
+const LOCAL_PATH = process.env.HOME
+  ? `${process.env.HOME}/.openclaw`
+  : "/root/.openclaw";
 const WORKSPACE_PREFIX = ".openclaw";
 
 // Skip patterns — files/dirs that should not be synced to S3
-const SKIP_PATTERNS = ["node_modules/", ".cache/", "*.log", "*.lock", ".npm/", "package-lock.json"];
+const SKIP_PATTERNS = [
+  "node_modules/",
+  ".cache/",
+  "*.log",
+  "*.lock",
+  ".npm/",
+  "package-lock.json",
+  "openclaw.json",
+];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // S3 client singleton (same pattern as agentcore-proxy.js)
@@ -38,7 +53,10 @@ function shouldSkip(relativePath) {
   for (const pattern of SKIP_PATTERNS) {
     if (pattern.endsWith("/")) {
       // Directory pattern
-      if (relativePath.startsWith(pattern) || relativePath.includes("/" + pattern)) {
+      if (
+        relativePath.startsWith(pattern) ||
+        relativePath.includes("/" + pattern)
+      ) {
         return true;
       }
     } else if (pattern.startsWith("*")) {
@@ -68,7 +86,9 @@ async function restoreWorkspace(namespace) {
   const prefix = `${namespace}/${WORKSPACE_PREFIX}/`;
   const s3 = getS3Client();
 
-  console.log(`[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}`);
+  console.log(
+    `[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}`,
+  );
 
   let totalFiles = 0;
   let continuationToken;
@@ -94,14 +114,21 @@ async function restoreWorkspace(namespace) {
       // Path traversal protection: ensure resolved path stays within LOCAL_PATH
       const resolvedFile = path.resolve(localFile);
       const resolvedBase = path.resolve(LOCAL_PATH);
-      if (!resolvedFile.startsWith(resolvedBase + path.sep) && resolvedFile !== resolvedBase) {
-        console.warn(`[workspace-sync] Path traversal blocked: ${relativePath}`);
+      if (
+        !resolvedFile.startsWith(resolvedBase + path.sep) &&
+        resolvedFile !== resolvedBase
+      ) {
+        console.warn(
+          `[workspace-sync] Path traversal blocked: ${relativePath}`,
+        );
         continue;
       }
 
       try {
         fs.mkdirSync(localDir, { recursive: true });
-        const getResp = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }));
+        const getResp = await s3.send(
+          new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }),
+        );
         const chunks = [];
         for await (const chunk of getResp.Body) {
           chunks.push(chunk);
@@ -109,14 +136,20 @@ async function restoreWorkspace(namespace) {
         fs.writeFileSync(localFile, Buffer.concat(chunks));
         totalFiles++;
       } catch (err) {
-        console.warn(`[workspace-sync] Failed to restore ${relativePath}: ${err.message}`);
+        console.warn(
+          `[workspace-sync] Failed to restore ${relativePath}: ${err.message}`,
+        );
       }
     }
 
-    continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+    continuationToken = response.IsTruncated
+      ? response.NextContinuationToken
+      : undefined;
   } while (continuationToken);
 
-  console.log(`[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}`);
+  console.log(
+    `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}`,
+  );
 }
 
 /**
@@ -165,20 +198,26 @@ async function saveWorkspace(namespace) {
     try {
       const stat = fs.statSync(localFile);
       if (stat.size > MAX_FILE_SIZE) {
-        console.warn(`[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${MAX_FILE_SIZE})`);
+        console.warn(
+          `[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${MAX_FILE_SIZE})`,
+        );
         skipped++;
         continue;
       }
 
       const content = fs.readFileSync(localFile);
-      await s3.send(new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: `${prefix}${relativePath}`,
-        Body: content,
-      }));
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: BUCKET,
+          Key: `${prefix}${relativePath}`,
+          Body: content,
+        }),
+      );
       uploaded++;
     } catch (err) {
-      console.warn(`[workspace-sync] Failed to save ${relativePath}: ${err.message}`);
+      console.warn(
+        `[workspace-sync] Failed to save ${relativePath}: ${err.message}`,
+      );
     }
   }
 
@@ -192,7 +231,9 @@ let _saveInterval = null;
  * Start periodic workspace saves.
  */
 function startPeriodicSave(namespace, intervalMs) {
-  const interval = intervalMs || parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
+  const interval =
+    intervalMs ||
+    parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
   if (_saveInterval) clearInterval(_saveInterval);
 
   _saveInterval = setInterval(() => {
@@ -201,7 +242,9 @@ function startPeriodicSave(namespace, intervalMs) {
     });
   }, interval);
 
-  console.log(`[workspace-sync] Periodic save started (every ${interval / 1000}s)`);
+  console.log(
+    `[workspace-sync] Periodic save started (every ${interval / 1000}s)`,
+  );
 }
 
 /**

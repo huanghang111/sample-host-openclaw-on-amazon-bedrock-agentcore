@@ -13,7 +13,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron)
+- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
@@ -44,13 +44,16 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   | AgentCore Runtime     |  <-- Per-user microVM (ARM64, VPC mode)
   |                       |
   | agentcore-contract.js (8080) -- /ping (Healthy), /invocations
-  |   -> lazy init:
-  |     1. Restore .openclaw/ from S3
-  |     2. Start proxy (18790) with USER_ID env
-  |     3. Start OpenClaw headless (18789)
-  |     4. Bridge messages via WebSocket
+  |   -> boot: pre-fetch secrets from Secrets Manager
+  |   -> first /invocations (parallel):
+  |     1. Start proxy (18790) + OpenClaw (18789) + restore .openclaw/
+  |     2. Wait for proxy only (~5s)
+  |     3. Lightweight agent handles messages immediately
+  |   -> background: OpenClaw starts (~2-4 min)
+  |   -> handoff: once OpenClaw ready, route via WebSocket bridge
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
+  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, 10 tools: s3-user-files, eventbridge-cron, web_fetch, web_search)
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
   +-----------+-----------+
@@ -108,7 +111,9 @@ openclaw-on-agentcore/
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
-    agentcore-contract.js         # AgentCore HTTP contract with lazy init + WebSocket bridge
+    agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
@@ -171,11 +176,12 @@ export CDK_DEFAULT_REGION=us-west-2  # change to your preferred region
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
-docker build --platform linux/arm64 -t openclaw-bridge bridge/
-docker tag openclaw-bridge:latest \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
+docker build --platform linux/arm64 -t openclaw-bridge:v${VERSION} bridge/
+docker tag openclaw-bridge:v${VERSION} \
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 docker push \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 ```
 
 ### Webhook Setup (Telegram)
@@ -243,6 +249,7 @@ source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval nev
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
+cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
@@ -295,6 +302,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
+| `subagent_model_id` | (empty) | Bedrock model for sub-agents. Empty = use `default_model_id` |
 
 ## Container Startup Sequence
 
@@ -302,16 +310,17 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
 3. **On first `/invocations` with `action: chat` or `action: warmup`** (lazy init):
    - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js`
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Write headless OpenClaw config (no channels)
-   - Start OpenClaw gateway (port 18789) — ~4 min startup
-   - Start periodic workspace saves (every 5 min)
-4. **`action: warmup`**: Triggers lazy init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
-5. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
-6. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
-7. **Subsequent `/invocations` with `action: chat`**: Bridge message via WebSocket to OpenClaw
-8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
+   - Start OpenClaw gateway (port 18789) in background
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Wait for proxy only (~5s)
+4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
+5. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
+7. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
+8. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
+9. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
+10. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
 
@@ -405,14 +414,21 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - Empty `cdk.json` account: falls back to `CDK_DEFAULT_ACCOUNT` env var via `app.py`
 
 ### OpenClaw
-- Startup takes ~4 minutes (plugin registration)
-- Correct start command: `openclaw gateway run --port 18789 --bind lan --verbose`
-- **`skills.allowBundled`**: Must be an array (e.g., `["*"]`), not a boolean
-- **ClawHub skill paths**: `clawhub install` installs to `/skills/<name>` — use `/skills` as `extraDirs`
-- **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--force`
+- Startup takes ~2-4 minutes (plugin registration); lightweight agent shim handles messages during this time
+- Correct start command: `openclaw gateway run --port 18789 --verbose` (no `--bind lan` — localhost binding sufficient since both processes run in the same container)
+- **Tool profile**: Uses `"full"` profile with a deny list. Do NOT use `"basic"` (undocumented, may disable web tools). Documented profiles: `minimal`, `coding`, `messaging`, `full`
+- **Deny list**: `["write", "edit", "apply_patch", "browser", "canvas", "cron", "gateway"]` — local writes use S3 skill, no browser/UI in container, EventBridge replaces built-in cron
+- **Sub-agent sandbox**: Must be `"off"` — no Docker inside AgentCore microVMs. MicroVMs already provide per-user isolation
+- **Sub-agent model**: Configurable via `SUBAGENT_MODEL` env var (from `subagent_model_id` in cdk.json). Empty = use same as main model
+- **`skipBootstrap` removed**: No longer a valid config key — OpenClaw rejects unknown keys and exits with code 1
+- **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
+- **ClawHub skill paths**: `clawhub install` installs to managed skills path — OpenClaw scans this automatically. Custom skills in `/skills/` loaded via `extraDirs`
+- **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--no-input --force` for non-interactive Docker builds
+- **5 ClawHub skills installed**: jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer (reduced from 8 — duckduckgo-search, hackernews, news-feed removed to optimize cold start; web search handled by lightweight agent's built-in web_search tool)
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
 - **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
-- **OpenClaw 2026.2.23 breaking change**: Non-loopback `controlUi` requires `dangerouslyAllowHostHeaderOriginFallback: true` or explicit `allowedOrigins`. Without this, `openclaw gateway run --bind lan` fails with `Error: non-loopback Control UI requires gateway.controlUi.allowedOrigins`
+- **OpenClaw 2026.2.23 breaking change**: Non-loopback bindings require `controlUi.allowedOrigins` or `dangerouslyAllowHostHeaderOriginFallback`. Solution: use localhost binding (no `--bind lan`), set `controlUi: { enabled: false, allowInsecureAuth: true, dangerouslyDisableDeviceAuth: true }`. The `dangerouslyDisableDeviceAuth` is needed for WebSocket auth without HTTPS
+- **Workspace sync overwrites config**: The `.openclaw/` S3 sync can overwrite `openclaw.json` with stale configs. `openclaw.json` is excluded from sync via SKIP_PATTERNS — config is always programmatically generated by `writeOpenClawConfig()`
 
 ### Cognito Identity
 - Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`
@@ -425,7 +441,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Webhook validation**: Telegram uses `X-Telegram-Bot-Api-Secret-Token` header (set via `secret_token` on `setWebhook`). Slack uses `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window
 - **Async dispatch**: Self-invokes with `InvocationType=Event` for actual processing; returns 200 immediately to webhook
 - **Slack**: Handles `url_verification` challenge synchronously; ignores retries via `x-slack-retry-num` header
-- **Cold start latency**: First message to a new user triggers microVM creation + OpenClaw startup (~4 min)
+- **Cold start latency**: First message to a new user triggers microVM creation; lightweight agent responds in ~10-15s while OpenClaw starts in background (~2-4 min)
 - **Telegram typing indicator**: Sent while waiting for AgentCore response
 - **Cross-channel binding**: "link accounts" generates 6-char code in DynamoDB with 10-min TTL
 - **Image uploads**: Telegram photos and Slack file attachments (JPEG, PNG, GIF, WebP, max 3.75 MB) are downloaded by the Router Lambda, uploaded to S3 under `{namespace}/_uploads/`, and passed to AgentCore as a structured message `{text, images[{s3Key, contentType}]}`
@@ -459,3 +475,4 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Per-user sessions**: Contract server sets `USER_ID` env var when starting proxy, so identity is always resolved from environment in per-user mode
 - **S3-backed isolation**: User files in `s3://openclaw-user-files-{account}-{region}/{namespace}/`
 - **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
+- **actorId vs namespace**: actorId uses colon format (`telegram:6087229962`), namespace uses underscore format (`telegram_6087229962`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys

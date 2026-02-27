@@ -1,5 +1,7 @@
-# AgentCore Runtime requires ARM64
-FROM --platform=linux/arm64 node:22-slim
+# ============================================================
+# Stage 1: Builder — install all dependencies and tools
+# ============================================================
+FROM --platform=linux/arm64 node:22-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -12,28 +14,25 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
 
+# Install ClawHub community skills (5 high-value marketplace skills)
+# Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
+# hackernews (niche), news-feed (niche) to reduce startup time.
+# --no-input --force: non-interactive, skip VirusTotal warnings
+RUN clawhub install jina-reader --no-input --force && \
+    clawhub install deep-research-pro --no-input --force && \
+    clawhub install telegram-compose --no-input --force && \
+    clawhub install transcript --no-input --force && \
+    clawhub install task-decomposer --no-input --force
+
 # Create app directory
 RUN mkdir -p /app
 
-# Pre-install Tier 1+2 skills from ClawHub
-# DISABLED: clawhub fetch fails under QEMU ARM64 cross-platform emulation on macOS.
-# Re-enable when building on native ARM64 (e.g. EC2 Graviton or CI).
-# --force needed because some skills trigger VirusTotal flags for external API calls
-# RUN clawhub install duckduckgo-search --no-input --force && \
-#     clawhub install jina-reader --no-input --force && \
-#     clawhub install telegram-compose --no-input --force && \
-#     clawhub install transcript --no-input --force && \
-#     clawhub install deep-research-pro --no-input --force && \
-#     clawhub install hackernews --no-input --force && \
-#     clawhub install news-feed --no-input --force && \
-#     clawhub install task-decomposer --no-input --force && \
-#     clawhub install cron-mastery --no-input --force
-
 WORKDIR /app
 
-# Install AWS SDK and WebSocket library (used by proxy adapter and contract server)
+# Install AWS SDK and WebSocket library (production only)
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
-    npm install @aws-sdk/client-bedrock-runtime \
+    npm install --omit=dev \
+                @aws-sdk/client-bedrock-runtime \
                 @aws-sdk/client-cognito-identity-provider \
                 @aws-sdk/client-s3 \
                 @aws-sdk/client-secrets-manager \
@@ -42,12 +41,63 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/lib-dynamodb \
                 ws
 
+# Pre-warm V8 compile cache for heavy AWS SDK modules.
+# This populates the bytecode cache at build time so runtime module loading is faster.
+RUN mkdir -p /app/.compile-cache && \
+    NODE_COMPILE_CACHE=/app/.compile-cache node -e " \
+      require('@aws-sdk/client-bedrock-runtime'); \
+      require('@aws-sdk/client-cognito-identity-provider'); \
+      require('@aws-sdk/client-s3'); \
+      require('@aws-sdk/client-secrets-manager'); \
+      require('@aws-sdk/client-scheduler'); \
+      require('@aws-sdk/client-dynamodb'); \
+      require('@aws-sdk/lib-dynamodb'); \
+      require('ws'); \
+      console.log('[build] V8 compile cache pre-warmed'); \
+    "
+
+# ============================================================
+# Stage 2: Runtime — minimal image with only needed artifacts
+# ============================================================
+FROM --platform=linux/arm64 node:22-slim
+
+# Install only runtime system dependencies (no git, no pip, no build tools)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl jq python3 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy AWS CLI from builder
+COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
+COPY --from=builder /usr/local/lib/python3.*/dist-packages /usr/local/lib/python3.11/dist-packages
+COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
+
+# Copy OpenClaw and ClawHub from builder (global npm modules + binaries)
+COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+# Re-create symlinks instead of COPY (which resolves symlinks and breaks
+# relative imports like ./dist/entry.js in the openclaw ESM binary)
+RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
+    ln -s /usr/local/lib/node_modules/clawhub/bin/clawdhub.js /usr/local/bin/clawhub
+
+# Copy ClawHub installed skills (clawhub installs to /skills/ in builder)
+COPY --from=builder /skills/ /skills/
+
+# Copy app directory (node_modules, compile cache)
+COPY --from=builder /app/node_modules /app/node_modules
+COPY --from=builder /app/package.json /app/package.json
+COPY --from=builder /app/.compile-cache /app/.compile-cache
+
 # Ensure skills can resolve npm packages from /app/node_modules
 ENV NODE_PATH=/app/node_modules
+
+WORKDIR /app
+
+# Pre-create OpenClaw workspace directory (avoids mkdir at runtime)
+RUN mkdir -p /root/.openclaw
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
+COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY force-ipv4.js /app/force-ipv4.js
 
@@ -67,7 +117,6 @@ COPY CLAUDE.md /app/CLAUDE.md
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Create non-root user for running the application
 # AgentCore Runtime requires port 8080
 EXPOSE 8080
 

@@ -260,7 +260,6 @@ function extractSessionMetadata(parsed, headers) {
         bracketEnd > 0
           ? firstUserMsg.content.slice(0, bracketEnd + 1)
           : firstUserMsg.content.slice(0, 60);
-      console.log(`[proxy][identity-diag] msgPrefix="${prefix.slice(0, 120)}"`);
     }
   }
   console.log(
@@ -493,12 +492,24 @@ const WORKSPACE_DEFAULTS = {
     "No identity configured yet. When the user gives you a name, " +
     "vibe, or emoji, update this file.\n",
   "TOOLS.md":
-    "# Tools Documentation\n\n" +
-    "## Available Skills\n" +
+    "# Tools\n\n" +
+    "## Built-in Tools\n" +
+    "- **web_search**: Search the web for current information\n" +
+    "- **web_fetch**: Fetch and read web page content\n" +
+    "- **exec**: Run shell commands\n" +
+    "- **read**: Read local files\n\n" +
+    "## Custom Skills\n" +
     "- **s3-user-files**: Read, write, list, and delete files in your personal workspace\n" +
-    "- **duckduckgo-search**: Search the web\n" +
-    "- **jina-reader**: Read web page content\n" +
-    "- **deep-research-pro**: In-depth research on complex topics\n",
+    "- **eventbridge-cron**: Schedule recurring tasks, reminders, and cron jobs\n\n" +
+    "## ClawHub Skills\n" +
+    "- **duckduckgo-search**: Web search via DuckDuckGo (no API key needed)\n" +
+    "- **jina-reader**: Extract web content as clean markdown\n" +
+    "- **deep-research-pro**: In-depth multi-step research on complex topics\n" +
+    "- **telegram-compose**: Rich HTML formatting for Telegram messages\n" +
+    "- **transcript**: YouTube video transcript extraction\n" +
+    "- **hackernews**: Browse and search Hacker News\n" +
+    "- **news-feed**: RSS-based news aggregation\n" +
+    "- **task-decomposer**: Break complex requests into manageable subtasks\n",
   "MEMORY.md":
     "# Notes & Memories\n\n" +
     "No notes yet. When the user asks you to remember something, " +
@@ -639,6 +650,11 @@ const VALID_CHANNELS = new Set([
   "whatsapp",
   "unknown",
 ]);
+
+async function retrieveMemoryContext(_actorId, _lastUserText) {
+  // Stub — memory retrieval not yet implemented.
+  return "";
+}
 
 async function buildUserIdentityContext(actorId, channel) {
   const safeChannel = VALID_CHANNELS.has(channel) ? channel : "unknown";
@@ -1343,18 +1359,6 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
-        // Build augmented system text with user identity context.
-        const identityContext = await buildUserIdentityContext(
-          actorId,
-          channel,
-        );
-        const systemMessages = messages.filter((m) => m.role === "system");
-        const baseSystemText =
-          systemMessages.length > 0
-            ? systemMessages.map((m) => m.content).join("\n")
-            : SYSTEM_PROMPT;
-        const systemTextOverride = baseSystemText + identityContext;
-
         // --- Convert OpenAI tools to Bedrock toolConfig ---
         const toolConfig = convertTools(parsed.tools);
         if (toolConfig) {
@@ -1421,6 +1425,33 @@ const server = http.createServer(async (req, res) => {
             }
           }
         }
+
+        // --- Retrieve memory context for this user ---
+        const lastUserMsg = [...messages]
+          .reverse()
+          .find((m) => m.role === "user");
+        const lastUserText = lastUserMsg
+          ? typeof lastUserMsg.content === "string"
+            ? lastUserMsg.content
+            : JSON.stringify(lastUserMsg.content)
+          : "";
+        const memoryContext = await retrieveMemoryContext(
+          actorId,
+          lastUserText,
+        );
+
+        // Build augmented system text with user identity + memory context.
+        // Identity is ALWAYS injected; memory context may be empty string.
+        const identityContext = await buildUserIdentityContext(
+          actorId,
+          channel,
+        );
+        const systemMessages = messages.filter((m) => m.role === "system");
+        const baseSystemText =
+          systemMessages.length > 0
+            ? systemMessages.map((m) => m.content).join("\n")
+            : SYSTEM_PROMPT;
+        const systemTextOverride = baseSystemText + identityContext + memoryContext;
 
         // --- Direct Bedrock path ---
         if (stream) {
