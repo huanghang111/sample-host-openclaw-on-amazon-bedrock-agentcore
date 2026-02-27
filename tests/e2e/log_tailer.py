@@ -185,7 +185,11 @@ def tail_logs(
                     limit=100,
                     interleaved=True,
                 )
-        except Exception:
+        except Exception as e:
+            err_msg = f"[log_tailer] CloudWatch error: {type(e).__name__}: {e}"
+            if err_msg not in result.raw_lines:
+                result.raw_lines.append(err_msg)
+                print(err_msg, flush=True)
             time.sleep(poll_interval_s)
             continue
 

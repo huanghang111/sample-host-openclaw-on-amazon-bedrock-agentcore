@@ -527,27 +527,36 @@ async function executeWebFetch(url, depth = 0) {
 
         let data = "";
         let bytes = 0;
-        let truncated = false;
+        let resolved = false;
         res.on("data", (chunk) => {
           bytes += chunk.length;
           if (bytes > WEB_FETCH_MAX_BYTES) {
-            truncated = true;
+            // Resolve immediately with collected data before destroying
+            if (!resolved) {
+              resolved = true;
+              const text = stripHtml(data);
+              resolve(
+                (text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)") +
+                  "\n\n[Content truncated at size limit]",
+              );
+            }
             res.destroy();
             return;
           }
           data += chunk;
         });
         res.on("end", () => {
-          const suffix = truncated
-            ? "\n\n[Content truncated at size limit]"
-            : "";
-          const text = stripHtml(data);
-          resolve(
-            (text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)") + suffix,
-          );
+          if (!resolved) {
+            resolved = true;
+            const text = stripHtml(data);
+            resolve(text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)");
+          }
         });
         res.on("error", (err) => {
-          resolve(`Error: ${err.message}`);
+          if (!resolved) {
+            resolved = true;
+            resolve(`Error: ${err.message}`);
+          }
         });
       },
     );
@@ -594,19 +603,31 @@ async function executeWebSearch(query) {
 
         let data = "";
         let bytes = 0;
+        let resolved = false;
         res.on("data", (chunk) => {
           bytes += chunk.length;
           if (bytes > WEB_FETCH_MAX_BYTES) {
+            // Resolve with what we have before destroying the stream
+            if (!resolved) {
+              resolved = true;
+              resolve(parseSearchResults(data));
+            }
             res.destroy();
             return;
           }
           data += chunk;
         });
         res.on("end", () => {
-          resolve(parseSearchResults(data));
+          if (!resolved) {
+            resolved = true;
+            resolve(parseSearchResults(data));
+          }
         });
         res.on("error", (err) => {
-          resolve(`Error: ${err.message}`);
+          if (!resolved) {
+            resolved = true;
+            resolve(`Error: ${err.message}`);
+          }
         });
       },
     );
@@ -891,7 +912,12 @@ async function chat(userMessage, userId) {
   }
 
   console.warn("[shim] Max iterations reached");
-  return "I ran into a limit processing your request. Please try rephrasing.";
+  const fallbackFooter =
+    "\n\n---\n" +
+    "_Warm-up mode — after full startup (~2-4 min), additional " +
+    "community skills come online: YouTube transcripts, deep research, " +
+    "task decomposition with sub-agents, etc._";
+  return "I ran into a limit processing your request. Please try rephrasing." + fallbackFooter;
 }
 
 module.exports = {
