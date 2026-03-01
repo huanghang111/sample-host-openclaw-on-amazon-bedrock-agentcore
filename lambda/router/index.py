@@ -14,6 +14,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -475,29 +476,108 @@ def _extract_text_from_content_blocks(text):
     return result
 
 
+def _markdown_to_telegram_html(text):
+    """Convert common Markdown to Telegram-compatible HTML.
+
+    Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>,
+    <a href="">, <blockquote>, <tg-spoiler>.
+
+    Strategy: extract code blocks/inline code first (protect from other
+    conversions), HTML-escape the rest, convert markdown patterns, then
+    re-insert code.
+    """
+    if not text:
+        return text
+
+    placeholders = []
+
+    def _placeholder(content):
+        idx = len(placeholders)
+        placeholders.append(content)
+        return f"\x00PH{idx}\x00"
+
+    # 1. Extract fenced code blocks: ```lang\n...\n```
+    text = re.sub(
+        r"```\w*\n?(.*?)```",
+        lambda m: _placeholder(
+            "<pre>{}</pre>".format(
+                m.group(1).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+        ),
+        text, flags=re.DOTALL,
+    )
+
+    # 2. Extract inline code: `text`
+    text = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: _placeholder(
+            "<code>{}</code>".format(
+                m.group(1).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+        ),
+        text,
+    )
+
+    # 3. HTML-escape remaining text
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # 4. Convert markdown patterns to HTML
+
+    # Headers: # Title → bold (Telegram has no header tag)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # Bold: **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+
+    # Italic: *text* (but not bullet points like "* item")
+    text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
+
+    # Strikethrough: ~~text~~
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+
+    # Links: [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Blockquotes: > text (at line start)
+    text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
+    # Merge adjacent blockquotes into one
+    text = text.replace("</blockquote>\n<blockquote>", "\n")
+
+    # Horizontal rules: --- or === or *** → thin line
+    text = re.sub(r"^[-=*]{3,}\s*$", "———", text, flags=re.MULTILINE)
+
+    # 5. Re-insert placeholders
+    for idx, content in enumerate(placeholders):
+        text = text.replace(f"\x00PH{idx}\x00", content)
+
+    return text
+
+
 def send_telegram_message(chat_id, text, token):
     """Send a message via Telegram Bot API.
 
-    Tries Markdown parse_mode first; falls back to plain text if Telegram
-    rejects the message (e.g., unescaped special characters in AI responses).
+    Converts Markdown to Telegram HTML for rich formatting. Falls back to
+    plain text if Telegram rejects the HTML (e.g., malformed tags).
     """
     if not token:
         logger.error("No Telegram token available")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    # Try with Markdown first
+    # Try with HTML (converted from Markdown)
+    html_text = _markdown_to_telegram_html(text)
     data = json.dumps({
         "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
+        "text": html_text,
+        "parse_mode": "HTML",
     }).encode()
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
         urllib_request.urlopen(req, timeout=10)
         return
     except Exception as e:
-        logger.warning("Telegram Markdown send failed (retrying as plain text): %s", e)
+        logger.warning("Telegram HTML send failed (retrying as plain text): %s", e)
 
     # Fallback: send as plain text (no parse_mode)
     data = json.dumps({
