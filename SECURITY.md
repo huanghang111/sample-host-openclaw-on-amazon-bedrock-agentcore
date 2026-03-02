@@ -72,6 +72,18 @@ Each user runs in their own **AgentCore microVM** with a dedicated S3 namespace:
 
 There is **no shared state** between users. Namespace derivation is system-controlled (from the channel identity) and cannot be influenced by user input.
 
+### STS Session-Scoped Credentials
+
+Beyond microVM isolation, S3 access is restricted at the **IAM level** using STS session policies:
+
+1. On container init, the contract server calls `STS:AssumeRole` on its own execution role with an inline session policy
+2. The session policy restricts S3 to `{bucket}/{namespace}/*` — the user can only access their own prefix
+3. OpenClaw is spawned with these scoped credentials via `credential_process`. Container-level credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_*`) are stripped from its environment
+4. Credentials are refreshed every 45 minutes (STS max session duration is 1 hour)
+5. The trusted proxy process retains full execution role credentials for Bedrock, Cognito, and S3 image access (with application-level namespace enforcement)
+
+This provides defense-in-depth: even if OpenClaw's bash tool or a skill attempts to access another user's S3 prefix, the IAM session policy denies the request. The session policy also scopes DynamoDB access to the identity table and EventBridge access to the cron schedule group.
+
 ### Identity Management
 
 **Cognito User Pool** provides per-user identity:
@@ -91,7 +103,7 @@ Each component has tightly scoped permissions:
 | Router Lambda | Invoke specific AgentCore Runtime only (not `Resource: *`) |
 | Router Lambda | Cognito operations scoped to specific user pool |
 | Router Lambda | Secrets Manager access limited to `openclaw/*` prefix |
-| AgentCore Container | S3 access scoped to user-files bucket |
+| AgentCore Container | S3 access scoped to user's namespace prefix via STS session policy |
 | AgentCore Container | Bedrock invoke scoped to specific model/inference profile |
 
 ## Data Protection

@@ -75,6 +75,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Network isolation**: Private VPC subnets with VPC endpoints; no direct internet exposure for containers
 - **Webhook authentication**: Cryptographic validation (Telegram secret token, Slack HMAC-SHA256 with replay protection)
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
+- **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 to the user's namespace prefix — prevents cross-user data access even through shell tools
 - **Encryption**: Data encrypted at rest (KMS) and in transit (TLS); secrets in Secrets Manager
 - **Least-privilege IAM**: Tightly scoped permissions per component
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
@@ -249,6 +250,9 @@ openclaw-on-agentcore/
     content-extraction.test.js    # Content block extraction tests (node:test)
     subagent-routing.test.js      # Subagent model routing + detection tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
+    workspace-sync.test.js        # Workspace sync credential tests (node:test, 7 tests)
+    scoped-credentials.js         # Per-user STS session-scoped S3 credentials
+    scoped-credentials.test.js    # Scoped credentials unit tests (node:test, 38 tests)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     CLAUDE.md                     # Project instructions (for Claude Code IDE)
     skills/
@@ -410,9 +414,11 @@ Each user gets their own AgentCore microVM. When a user sends a message:
 
 1. **Router Lambda** receives the webhook, resolves user identity in DynamoDB, and calls `InvokeAgentRuntime` with a per-user session ID
 2. **Contract server** (port 8080) handles the invocation — on first message, it runs parallel initialization:
+   - Creates STS scoped credentials restricting S3 to the user's namespace prefix
    - Starts the Bedrock proxy with `USER_ID`/`CHANNEL` env vars
-   - Starts OpenClaw gateway in headless mode (background)
+   - Starts OpenClaw gateway with scoped credentials (container credentials stripped)
    - Restores `.openclaw/` workspace from S3 (background)
+   - Starts credential refresh timer (45 min interval)
    - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately
 3. **Lightweight agent** (warm-up phase, ~5s to ~2-4min) runs an agentic loop with 10 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), and EventBridge cron scheduling (create/list/update/delete). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
 4. **WebSocket bridge** (after OpenClaw ready, ~2-4min) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
@@ -512,9 +518,11 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
 3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
 4. **On first `/invocations` with `action: chat`, `action: warmup`, or `action: cron`** (parallel init):
+   - Create STS scoped credentials restricting S3 to user's namespace prefix
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Start OpenClaw gateway (port 18789) in background
+   - Start OpenClaw gateway (port 18789) with scoped credentials (no container credentials)
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
 5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools — users can manage files and schedules immediately)
 6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
@@ -615,6 +623,8 @@ cd bridge && node --test image-support.test.js         # image upload + multimod
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge && node --test subagent-routing.test.js      # subagent model routing + detection tests
 cd bridge && node --test content-extraction.test.js    # recursive content block extraction tests
+cd bridge && node --test scoped-credentials.test.js    # per-user STS credential scoping tests
+cd bridge && node --test workspace-sync.test.js        # workspace sync credential tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
 cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
@@ -626,6 +636,7 @@ pytest tests/e2e/bot_test.py -v -k lifecycle            # full message lifecycle
 pytest tests/e2e/bot_test.py -v -k cold_start           # new session creation
 pytest tests/e2e/bot_test.py -v -k warmup               # warm-up shim verification
 pytest tests/e2e/bot_test.py -v -k full_startup          # full OpenClaw startup + timing (~5min)
+pytest tests/e2e/bot_test.py -v -k ScopedCredentials     # S3 file write/read/delete via scoped creds
 pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fire
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```

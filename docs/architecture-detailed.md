@@ -92,9 +92,10 @@ sequenceDiagram
     Note over RL,C: Typing indicator every 4s (Telegram)<br/>Progress message after 30s (both channels)
 
     opt First message (cold start)
+        AC->>AC: STS AssumeRole (scoped S3 creds)
         AC->>AC: Start proxy (~5s)
         AC->>S3: Restore .openclaw/ (background)
-        AC->>AC: Start OpenClaw (background, ~2-4 min)
+        AC->>AC: Start OpenClaw with scoped creds (background, ~2-4 min)
     end
 
     alt Warm-up phase (OpenClaw not ready)
@@ -309,5 +310,6 @@ See [SECURITY.md](../SECURITY.md) for comprehensive security documentation.
 - VPC isolation with 7 VPC endpoints
 - Webhook signature validation (Telegram + Slack)
 - Per-user microVM isolation
+- STS session-scoped S3 credentials (per-user namespace restriction)
 - KMS encryption at rest
 - Least-privilege IAM with cdk-nag enforcement

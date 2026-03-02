@@ -119,7 +119,7 @@ openclaw-on-agentcore/
     content-extraction.test.js    # Content block extraction tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
     scoped-credentials.js         # Per-user STS session-scoped S3 credentials
-    scoped-credentials.test.js    # Scoped credentials unit tests (node:test, 25 tests)
+    scoped-credentials.test.js    # Scoped credentials unit tests (node:test, 38 tests)
     workspace-sync.test.js        # Workspace sync credential tests (node:test, 7 tests)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     skills/
@@ -502,21 +502,19 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Graceful fallback**: If `EXECUTION_ROLE_ARN` is not set or STS fails, falls back to full execution role credentials with a warning log
 - **Proxy keeps full credentials**: The proxy process is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access (with application-level namespace enforcement)
 
-## Branch Awareness
+## Workflow Conventions
+
+### Branch Awareness
 Always confirm which git branch you are on BEFORE making any code changes or deployments. If the user specifies a branch, switch to it first and verify with `git branch --show-current`. Never assume the current branch is correct.
-Add under a ## Deployment section in CLAUDE.md\n\n
 
-
-## Deployment Target
+### Deployment Target
 Default deployment region is `ap-southeast-2`. Always use this region for ECR, CDK, and Docker operations unless explicitly told otherwise. After deploying, verify the old session/container is replaced — stale sessions can mask fixes.
-Add under ## Git Operations or ## Branch Awareness section in CLAUDE.md\n\n
 
-## Git Operations
+### Git Operations
 Never push to any remote (GitHub, GitLab, or otherwise) without explicit user confirmation. Always ask before pushing.
-Add as a top-level section in CLAUDE.md under ## Workflow Conventions\n\n
 
-## Planning vs Implementation
+### Planning vs Implementation
 When asked to create a plan, produce it concisely in ONE iteration. Do not endlessly revise or research unless asked. If the user says 'implement', move directly to code changes — do not re-plan. If a plan is approved, begin implementation immediately.
-Add at the very top of CLAUDE.md as ## Project Context so Claude always has this grounding\n\n
+
 ## Project Context
 This is a Python/Node.js project (OpenClaw on AWS Bedrock AgentCore). Key components: Telegram bot, Slack Socket Mode, CDK infrastructure, Docker/ECR deployments, S3 workspace, per-user memory isolation. Subagents are OpenClaw-native running on the same AgentCore runtime — they are NOT separate Bedrock agents.
