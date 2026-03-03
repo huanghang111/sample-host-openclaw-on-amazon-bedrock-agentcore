@@ -13,7 +13,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron) + 2 built-in shim tools (web_fetch, web_search)
+- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 3 custom skills (S3 user files, EventBridge cron, ClawHub manage) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
@@ -53,7 +53,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   |   -> handoff: once OpenClaw ready, route via WebSocket bridge
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
-  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, 10 tools: s3-user-files, eventbridge-cron, web_fetch, web_search)
+  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, 13 tools: s3-user-files, eventbridge-cron, clawhub-manage, web_fetch, web_search)
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
   +-----------+-----------+
@@ -112,8 +112,8 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
-    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
+    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage tools)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 73 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     content-extraction.test.js    # Content block extraction tests (node:test)
@@ -133,6 +133,11 @@ openclaw-on-agentcore/
         common.js                 # Shared utilities (schedule group, DynamoDB helpers)
         create.js / update.js     # Create/update EventBridge schedules
         list.js / delete.js       # List/delete schedules
+      clawhub-manage/             # ClawHub skill installer (install/uninstall/list)
+        SKILL.md                  # OpenClaw skill manifest
+        common.js                 # Skill name validation
+        install.js / uninstall.js # Install/uninstall ClawHub skills
+        list.js                   # List installed skills
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
@@ -329,7 +334,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
-4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
+4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, clawhub-manage, web_fetch, web_search tools)
 5. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
 6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
 7. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)

@@ -113,6 +113,10 @@ RUN chmod +x /skills/s3-user-files/*.js
 COPY skills/eventbridge-cron /skills/eventbridge-cron
 RUN chmod +x /skills/eventbridge-cron/*.js
 
+# Copy ClawHub skill management skill
+COPY skills/clawhub-manage /skills/clawhub-manage
+RUN chmod +x /skills/clawhub-manage/*.js
+
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md
 

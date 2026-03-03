@@ -21,11 +21,14 @@ describe("TOOLS", () => {
     "list_schedules",
     "update_schedule",
     "delete_schedule",
+    "install_skill",
+    "uninstall_skill",
+    "list_skills",
     "web_fetch",
     "web_search",
   ];
 
-  it("contains all 10 expected tools", () => {
+  it("contains all 13 expected tools", () => {
     const names = TOOLS.map((t) => t.function.name);
     assert.deepStrictEqual(names, EXPECTED_TOOLS);
   });
@@ -374,6 +377,28 @@ describe("buildToolArgs", () => {
   it("delete_schedule: defaults missing schedule_id to empty string", () => {
     const result = buildToolArgs("delete_schedule", {}, USER_ID);
     assert.equal(result[2], "");
+  });
+
+  // clawhub-manage tools
+  it("install_skill: returns script + skill_name", () => {
+    const result = buildToolArgs("install_skill", { skill_name: "baidu-search" }, USER_ID);
+    assert.deepStrictEqual(result, [
+      "/skills/clawhub-manage/install.js",
+      "baidu-search",
+    ]);
+  });
+
+  it("uninstall_skill: returns script + skill_name", () => {
+    const result = buildToolArgs("uninstall_skill", { skill_name: "transcript" }, USER_ID);
+    assert.deepStrictEqual(result, [
+      "/skills/clawhub-manage/uninstall.js",
+      "transcript",
+    ]);
+  });
+
+  it("list_skills: returns script only (no userId)", () => {
+    const result = buildToolArgs("list_skills", {}, USER_ID);
+    assert.deepStrictEqual(result, ["/skills/clawhub-manage/list.js"]);
   });
 });
 

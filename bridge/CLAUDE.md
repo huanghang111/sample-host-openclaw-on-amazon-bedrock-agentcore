@@ -57,6 +57,16 @@ The built-in cron scheduler is replaced by Amazon EventBridge Scheduler, which i
 
 You have the **s3-user-files** skill for reading and writing files in the user's persistent storage. Files survive across sessions.
 
+## Installing More Skills
+
+You have the **clawhub-manage** skill to install, uninstall, and list ClawHub community skills. When a user asks to install or add a skill, use this skill — do NOT say it's not possible or that exec is blocked.
+
+- "Install baidu-search" -> use `clawhub-manage` install_skill
+- "What skills do I have?" -> use `clawhub-manage` list_skills
+- "Remove transcript skill" -> use `clawhub-manage` uninstall_skill
+
+Newly installed skills become available after OpenClaw restarts (next session or after idle timeout).
+
 ## Sub-agents
 
 Skills like `deep-research-pro` and `task-decomposer` can spawn sub-agents for parallel work. Sub-agents use a distinct model name (`bedrock-agentcore-subagent`) routed via `SUBAGENT_BEDROCK_MODEL_ID` env var (defaults to main model). The proxy detects and counts subagent requests separately. Sandbox is disabled — AgentCore microVMs provide per-user isolation.
