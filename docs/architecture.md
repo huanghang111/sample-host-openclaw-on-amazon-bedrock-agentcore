@@ -369,5 +369,5 @@
 | Storage | S3 encryption | KMS-encrypted user files bucket, SSL enforced, public access blocked |
 | Audit | CloudTrail | API call logging with S3 storage and file validation |
 | Monitoring | CloudWatch alarms | Error rates, latency, throttles, budget thresholds |
-| Container | Tool deny list | exec/read tools blocked; proxy on loopback only |
+| Container | Tool deny list | `read` tool blocked (prevents credential access); `exec` allowed for skill management (STS-scoped); proxy on loopback only |
 | Cost | Token budgets | Daily token/cost alarms with anomaly detection |

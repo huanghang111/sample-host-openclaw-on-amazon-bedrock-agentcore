@@ -158,7 +158,7 @@ Secrets are:
 - Internal error details and stack traces are **never exposed** in API responses
 - Container runs on AgentCore's **Firecracker microVM** with hardware-level isolation
 - Each user session runs in a **separate microVM** (not shared containers)
-- OpenClaw tool deny list blocks **exec** and **read** tools to prevent credential access via /proc and local file reads
+- OpenClaw tool deny list blocks the **read** tool to prevent credential access via `/proc` and local file reads. The `exec` tool is allowed — skills like `clawhub-manage` use it to run scripts. STS session-scoped credentials limit the blast radius of any shell commands to the user's own S3 namespace
 - Bedrock proxy binds to **127.0.0.1** (loopback only), preventing network access from other containers
 - Security group egress restricted to **TCP 443 only** (HTTPS)
 - API Gateway **access logging** enabled for forensic analysis

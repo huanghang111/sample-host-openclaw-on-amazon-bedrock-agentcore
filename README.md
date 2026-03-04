@@ -78,7 +78,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, CloudTrail, Secrets Manager) and in transit (TLS)
 - **Least-privilege IAM**: Tightly scoped permissions per component
-- **Tool hardening**: OpenClaw exec/read tools denied to prevent credential access; proxy bound to loopback only; security group egress restricted to HTTPS
+- **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
 See [SECURITY.md](SECURITY.md) for the complete security architecture.
@@ -244,8 +244,8 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
-    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
+    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage tools)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 73 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     content-extraction.test.js    # Content block extraction tests (node:test)
@@ -259,6 +259,7 @@ openclaw-on-agentcore/
     skills/
       s3-user-files/              # Custom per-user file storage skill (S3-backed)
       eventbridge-cron/           # Cron scheduling skill (EventBridge Scheduler)
+      clawhub-manage/             # ClawHub skill installer (install/uninstall/list)
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py                    # Webhook router (Telegram + Slack, image uploads)
@@ -421,7 +422,7 @@ Each user gets their own AgentCore microVM. When a user sends a message:
    - Restores `.openclaw/` workspace from S3 (background)
    - Starts credential refresh timer (45 min interval)
    - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately
-3. **Lightweight agent** (warm-up phase, ~5s to ~2-4min) runs an agentic loop with 10 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), and EventBridge cron scheduling (create/list/update/delete). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
+3. **Lightweight agent** (warm-up phase, ~5s to ~2-4min) runs an agentic loop with 13 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), and ClawHub skill management (install/uninstall/list). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
 4. **WebSocket bridge** (after OpenClaw ready, ~2-4min) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
 5. **Router Lambda** sends the response back to the channel (Telegram/Slack API). While waiting, it sends typing indicators (Telegram) and a one-time progress message after 30s (both channels) for long-running requests
 
@@ -525,7 +526,7 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
-5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools — users can manage files and schedules immediately)
+5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, and clawhub-manage tools — users can manage files, schedules, and install skills immediately)
 6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
 7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 5 ClawHub skills (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer), sub-agent support, session management
 8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
@@ -542,12 +543,13 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
 
 ### Tools & Skills
 
-The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, sessions, automation). Two custom skills are included:
+The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, sessions, automation). Three custom skills are included:
 
 | Skill | Purpose |
 |---|---|
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
+| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills |
 
 Five ClawHub community skills are pre-installed at Docker build time:
 
@@ -559,7 +561,7 @@ Five ClawHub community skills are pre-installed at Docker build time:
 | `transcript` | YouTube video transcript extraction |
 | `task-decomposer` | Break complex requests into subtasks (spawns sub-agents) |
 
-During the warm-up phase (~first 2-4 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files` and `eventbridge-cron` skills. ClawHub skills become available after OpenClaw fully starts.
+During the warm-up phase (~first 2-4 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, and `clawhub-manage` skills. Users can install, uninstall, and list ClawHub skills even during warm-up. Installed skills become available after the next session start. ClawHub skills become available after OpenClaw fully starts.
 
 ### Webhook Security
 
@@ -639,6 +641,7 @@ pytest tests/e2e/bot_test.py -v -k warmup               # warm-up shim verificat
 pytest tests/e2e/bot_test.py -v -k full_startup          # full OpenClaw startup + timing (~5min)
 pytest tests/e2e/bot_test.py -v -k ScopedCredentials     # S3 file write/read/delete via scoped creds
 pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fire
+pytest tests/e2e/bot_test.py -v -k SkillManagement       # clawhub skill install/uninstall/list
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
@@ -716,7 +719,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
 - **`skills.allowBundled` is an array**: OpenClaw expects `["*"]` (not `true`) — boolean causes config validation failure.
-- **ClawHub skills**: 5 community skills are pre-installed at Docker build time (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer). Custom skills (s3-user-files, eventbridge-cron) are in `/skills/` loaded via `extraDirs`. ClawHub installs to the managed skills path, scanned automatically by OpenClaw.
+- **ClawHub skills**: 5 community skills are pre-installed at Docker build time (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer). Custom skills (s3-user-files, eventbridge-cron, clawhub-manage) are in `/skills/` loaded via `extraDirs`. ClawHub installs to the managed skills path, scanned automatically by OpenClaw. Users can install/uninstall skills via the `clawhub-manage` skill — changes take effect on the next session start.
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:123456789`) while skill scripts expect namespace/underscore format (`telegram_123456789`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
