@@ -438,7 +438,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - Startup takes ~2-4 minutes (plugin registration); lightweight agent shim handles messages during this time
 - Correct start command: `openclaw gateway run --port 18789 --verbose` (no `--bind lan` — localhost binding sufficient since both processes run in the same container)
 - **Tool profile**: Uses `"full"` profile with a deny list. Do NOT use `"basic"` (undocumented, may disable web tools). Documented profiles: `minimal`, `coding`, `messaging`, `full`
-- **Deny list**: `["write", "edit", "apply_patch", "exec", "read", "browser", "canvas", "cron", "gateway"]` — local writes use S3 skill, exec/read blocked to prevent credential access via /proc, no browser/UI in container, EventBridge replaces built-in cron
+- **Deny list**: `["write", "edit", "apply_patch", "read", "browser", "canvas", "cron", "gateway"]` — local writes use S3 skill, `read` blocked to prevent credential reads, no browser/UI in container, EventBridge replaces built-in cron. `exec` is NOT denied — skills like `clawhub-manage` need it; scoped STS credentials limit blast radius
 - **Sub-agent sandbox**: Must be `"off"` — no Docker inside AgentCore microVMs. MicroVMs already provide per-user isolation
 - **Sub-agent model**: Configurable via `SUBAGENT_BEDROCK_MODEL_ID` env var (from `subagent_model_id` in cdk.json). Empty = use same as main model. Subagents use a distinct model name (`bedrock-agentcore-subagent`) so the proxy can detect and count them separately
 - **`skipBootstrap` removed**: No longer a valid config key — OpenClaw rejects unknown keys and exits with code 1

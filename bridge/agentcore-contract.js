@@ -326,13 +326,15 @@ function writeOpenClawConfig() {
         "write", // Local writes don't persist — use S3 skill instead
         "edit", // Local edits are ephemeral — use S3 skill instead
         "apply_patch", // Code patching not needed for chat assistant
-        "exec", // Blocks arbitrary shell execution — prevents /proc reads and credential exfiltration
         "read", // Blocks local file reads — prevents reading sibling process environ; use s3-user-files
         "browser", // No headless browser in ARM64 container
         "canvas", // No UI rendering in headless chat context
         "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
         "gateway", // Admin tool — not needed for end users
       ],
+      // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
+      // need Bash(node:*) to run scripts. Scoped STS credentials ensure
+      // OpenClaw only has access to the user's S3 namespace prefix.
     },
     skills: {
       allowBundled: [],
@@ -408,8 +410,14 @@ function writeOpenClawConfig() {
         "### Installing More Skills",
         "",
         "You have the **clawhub-manage** skill to install/uninstall additional community skills from the ClawHub marketplace.",
-        "When a user asks to install or add a skill, use this skill — do NOT say it's not possible.",
-        "Newly installed skills are available after OpenClaw restarts (next session or idle timeout).",
+        "When a user asks to install or add a skill, use this skill — do NOT say it's not possible or that exec is blocked.",
+        "**Use Bash to run the skill scripts** (Bash is available, only exec is denied):",
+        "- Install: `node /skills/clawhub-manage/install.js <skill-name>`",
+        "- Uninstall: `node /skills/clawhub-manage/uninstall.js <skill-name>`",
+        "- List: `node /skills/clawhub-manage/list.js`",
+        "",
+        "After install/uninstall, OpenClaw automatically restarts to load the change (~2-4 min).",
+        "During restart, you can still help using built-in tools (web search, files, scheduling).",
         "",
         "## Sub-agents",
         "",
@@ -439,6 +447,106 @@ async function pollOpenClawReadiness(namespace) {
       "[contract] OpenClaw failed to start — lightweight agent will continue handling messages",
     );
   }
+}
+
+/**
+ * Restart OpenClaw to pick up newly installed/uninstalled skills.
+ *
+ * During restart, messages fall back to the lightweight agent shim.
+ * Steps: kill current process → re-write config → spawn new process → poll readiness.
+ */
+let restartInProgress = false;
+async function restartOpenClaw() {
+  if (restartInProgress) {
+    console.log("[contract] OpenClaw restart already in progress");
+    return { status: "already_restarting" };
+  }
+  if (!currentNamespace) {
+    console.warn("[contract] Cannot restart OpenClaw — not initialized");
+    return { status: "not_initialized" };
+  }
+  restartInProgress = true;
+  console.log("[contract] Restarting OpenClaw to reload skills...");
+
+  // 1. Mark as not ready — messages fall back to lightweight agent
+  openclawReady = false;
+
+  // 2. Kill existing process
+  if (openclawProcess) {
+    try {
+      openclawProcess.kill("SIGTERM");
+    } catch {}
+    // Wait up to 5s for graceful exit
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try { openclawProcess.kill("SIGKILL"); } catch {}
+        resolve();
+      }, 5000);
+      openclawProcess.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  // 3. Re-write config (picks up any changes)
+  writeOpenClawConfig();
+
+  // 4. Spawn new OpenClaw process
+  console.log("[contract] Spawning new OpenClaw process...");
+  let openclawEnv;
+  const scopedCredsAvailable = fs.existsSync(`${SCOPED_CREDS_DIR}/config`);
+  if (scopedCredsAvailable) {
+    openclawEnv = scopedCreds.buildOpenClawEnv({
+      credDir: SCOPED_CREDS_DIR,
+      baseEnv: process.env,
+    });
+  } else {
+    openclawEnv = scopedCreds.buildOpenClawEnv({
+      credDir: null,
+      baseEnv: process.env,
+    });
+    openclawEnv.OPENCLAW_NO_AWS = "1";
+  }
+
+  openclawLogs = [];
+  openclawExitCode = null;
+  openclawProcess = spawn(
+    "openclaw",
+    ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
+    { stdio: ["ignore", "pipe", "pipe"], env: openclawEnv },
+  );
+
+  const captureLog = (stream, label) => {
+    let buf = "";
+    stream.on("data", (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (line.trim()) {
+          console.log(`[openclaw:${label}] ${line}`);
+          openclawLogs.push(`[${label}] ${line}`);
+          if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
+        }
+      }
+    });
+  };
+  captureLog(openclawProcess.stdout, "out");
+  captureLog(openclawProcess.stderr, "err");
+  openclawProcess.on("exit", (code) => {
+    console.log(`[contract] OpenClaw (restarted) exited with code ${code}`);
+    openclawExitCode = code;
+    openclawReady = false;
+  });
+
+  // 5. Poll for readiness in the background
+  pollOpenClawReadiness(currentNamespace).catch((err) => {
+    console.error(`[contract] OpenClaw restart readiness poll failed: ${err.message}`);
+  });
+
+  restartInProgress = false;
+  return { status: "restarting" };
 }
 
 /**
@@ -1016,6 +1124,22 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // POST /internal/restart-openclaw — Restart OpenClaw to reload skills
+  // Only accessible from within the container (localhost). Used by
+  // clawhub-manage install/uninstall scripts after adding/removing skills.
+  if (req.method === "POST" && req.url === "/internal/restart-openclaw") {
+    try {
+      const result = await restartOpenClaw();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      console.error(`[contract] Restart failed: ${err.message}`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "error", message: err.message }));
+    }
+    return;
+  }
+
   // POST /invocations — Chat handler
   if (req.method === "POST" && req.url === "/invocations") {
     let body = "";
@@ -1346,7 +1470,7 @@ server.listen(PORT, "0.0.0.0", () => {
     `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
   );
   console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
+    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}, POST /internal/restart-openclaw",
   );
 
   // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)

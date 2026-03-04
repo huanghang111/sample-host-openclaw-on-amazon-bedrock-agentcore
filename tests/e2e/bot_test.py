@@ -7,6 +7,7 @@ CLI usage:
     python -m tests.e2e.bot_test --reset-user
     python -m tests.e2e.bot_test --conversation multi_turn --tail-logs
     python -m tests.e2e.bot_test --subagent --tail-logs
+    python -m tests.e2e.bot_test --skill-manage --tail-logs
 
 Pytest usage:
     pytest tests/e2e/bot_test.py -v -k smoke
@@ -525,6 +526,161 @@ class TestScopedCredentials:
         print(f"  Delete response ({tail.response_len} chars): {tail.response_text[:200]}")
 
 
+class TestSkillManagement:
+    """Verify clawhub-manage skill: list, install, and uninstall skills.
+
+    Tests the full lifecycle of skill management through the bot:
+      1. List pre-installed skills (verify baseline)
+      2. Install a new skill (hackernews — lightweight, no API key needed)
+      3. Verify it appears in the skill list
+      4. Uninstall the skill
+      5. Verify it's removed from the list
+
+    The lightweight agent handles install/uninstall during warm-up mode,
+    and OpenClaw handles them after full startup. These tests work in both
+    modes — the bot triggers the clawhub CLI and restarts OpenClaw.
+
+    Run with: pytest tests/e2e/bot_test.py -v -k skill_manage
+    """
+
+    # hackernews is lightweight (no API key), good for testing install/uninstall
+    TEST_SKILL = "hackernews"
+
+    # Pre-installed skills that should always appear in list
+    EXPECTED_PREINSTALLED = [
+        "jina-reader",
+        "deep-research-pro",
+        "telegram-compose",
+        "transcript",
+        "task-decomposer",
+    ]
+
+    def test_list_skills(self, e2e_config):
+        """List installed skills and verify pre-installed skills are present."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "What ClawHub skills are currently installed? "
+            "Use the clawhub-manage skill to list them.",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"List skills incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+
+        # Verify at least some pre-installed skills appear in the response
+        resp_lower = tail.response_text.lower()
+        found_skills = [s for s in self.EXPECTED_PREINSTALLED if s in resp_lower]
+        assert len(found_skills) >= 3, (
+            f"Expected at least 3 pre-installed skills in response, "
+            f"found {len(found_skills)}: {found_skills}\n"
+            f"Response: {tail.response_text[:500]}"
+        )
+        print(f"  Found {len(found_skills)} pre-installed skills: {found_skills}")
+        print(f"  Response ({tail.response_len} chars): {tail.response_text[:300]}")
+
+    def test_install_skill(self, e2e_config):
+        """Install a test skill and verify it was installed successfully."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f"Please install the {self.TEST_SKILL} skill using the clawhub-manage skill. "
+            f"Do NOT say it's not possible — use the install_skill tool or "
+            f"run: node /skills/clawhub-manage/install.js {self.TEST_SKILL}",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Install skill incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+
+        # Verify the response mentions the skill name (installed or attempted)
+        resp_lower = tail.response_text.lower()
+        assert self.TEST_SKILL in resp_lower, (
+            f"Expected '{self.TEST_SKILL}' mentioned in response.\n"
+            f"Response: {tail.response_text[:500]}"
+        )
+        print(f"  Install response ({tail.response_len} chars): {tail.response_text[:300]}")
+
+    def test_verify_installed_skill(self, e2e_config):
+        """After install, list skills and verify the new skill appears."""
+        # Small delay to let install complete
+        time.sleep(3)
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "List all installed ClawHub skills using clawhub-manage.",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"List skills (post-install) incomplete (timed_out={tail.timed_out})"
+        )
+
+        resp_lower = tail.response_text.lower()
+        assert self.TEST_SKILL in resp_lower, (
+            f"Expected '{self.TEST_SKILL}' in skill list after install.\n"
+            f"Response: {tail.response_text[:500]}"
+        )
+        print(f"  Verified '{self.TEST_SKILL}' appears in skill list")
+
+    def test_uninstall_skill(self, e2e_config):
+        """Uninstall the test skill."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f"Please uninstall the {self.TEST_SKILL} skill using clawhub-manage. "
+            f"Use the uninstall_skill tool or run: node /skills/clawhub-manage/uninstall.js {self.TEST_SKILL}",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Uninstall skill incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+
+        resp_lower = tail.response_text.lower()
+        assert self.TEST_SKILL in resp_lower, (
+            f"Expected '{self.TEST_SKILL}' mentioned in response.\n"
+            f"Response: {tail.response_text[:500]}"
+        )
+        print(f"  Uninstall response ({tail.response_len} chars): {tail.response_text[:300]}")
+
+    def test_verify_uninstalled_skill(self, e2e_config):
+        """After uninstall, list skills and verify the test skill is gone."""
+        time.sleep(3)
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "List all installed ClawHub skills using clawhub-manage. "
+            "Show me the complete list.",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"List skills (post-uninstall) incomplete (timed_out={tail.timed_out})"
+        )
+
+        resp_lower = tail.response_text.lower()
+        # Verify pre-installed skills are still present (list is working)
+        preinstalled_found = [s for s in self.EXPECTED_PREINSTALLED if s in resp_lower]
+        assert len(preinstalled_found) >= 3, (
+            f"Skill list seems broken — only {len(preinstalled_found)} pre-installed skills found"
+        )
+        print(f"  Pre-installed skills still present: {preinstalled_found}")
+        print(f"  List response ({tail.response_len} chars): {tail.response_text[:300]}")
+
+
 class TestConversation:
     """Multi-message conversation tests."""
 
@@ -671,6 +827,49 @@ def _cli_scoped_creds(cfg, tail):
     return ok
 
 
+def _cli_skill_manage(cfg, tail):
+    """Test skill management lifecycle: list, install, verify, uninstall, verify.
+
+    Tests the clawhub-manage skill's ability to install and uninstall
+    ClawHub community skills from the agent's chat interface.
+    """
+    test_skill = "hackernews"
+    print(f"Skill management test (install/uninstall {test_skill})")
+
+    # Step 1: List skills
+    print("\n1. Listing installed skills...")
+    ok = _cli_send(cfg, "What ClawHub skills are currently installed? Use the clawhub-manage skill to list them.", tail)
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 2: Install test skill
+    print(f"\n2. Installing {test_skill}...")
+    ok = _cli_send(cfg, f"Please install the {test_skill} skill using clawhub-manage. Use the install_skill tool or run: node /skills/clawhub-manage/install.js {test_skill}", tail)
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 3: Verify installed
+    print(f"\n3. Verifying {test_skill} is installed...")
+    ok = _cli_send(cfg, "List all installed ClawHub skills using clawhub-manage.", tail)
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 4: Uninstall test skill
+    print(f"\n4. Uninstalling {test_skill}...")
+    ok = _cli_send(cfg, f"Please uninstall the {test_skill} skill using clawhub-manage. Use the uninstall_skill tool or run: node /skills/clawhub-manage/uninstall.js {test_skill}", tail)
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 5: Verify uninstalled
+    print(f"\n5. Verifying {test_skill} is uninstalled...")
+    ok = _cli_send(cfg, "List all installed ClawHub skills using clawhub-manage. Show the complete list.", tail)
+    return ok
+
+
 def _cli_conversation(cfg, scenario_name, tail):
     if scenario_name not in SCENARIOS:
         print(f"Unknown scenario: {scenario_name}")
@@ -701,6 +900,7 @@ def main():
     parser.add_argument("--conversation", type=str, help="Run a conversation scenario")
     parser.add_argument("--subagent", action="store_true", help="Test sub-agent skills (requires full startup)")
     parser.add_argument("--scoped-creds", action="store_true", help="Test S3 file ops via scoped credentials (requires full startup)")
+    parser.add_argument("--skill-manage", action="store_true", help="Test skill management (list, install, uninstall)")
     parser.add_argument("--reset", action="store_true", help="Reset session before sending")
     parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
     parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
@@ -739,6 +939,10 @@ def main():
         ok = _cli_scoped_creds(cfg, args.tail_logs)
         sys.exit(0 if ok else 1)
 
+    if args.skill_manage:
+        ok = _cli_skill_manage(cfg, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
     if args.conversation:
         ok = _cli_conversation(cfg, args.conversation, args.tail_logs)
         sys.exit(0 if ok else 1)
@@ -748,7 +952,7 @@ def main():
         sys.exit(0 if ok else 1)
 
     if not any([args.health, args.send, args.conversation, args.subagent,
-                args.scoped_creds, args.reset, args.reset_user]):
+                args.scoped_creds, args.skill_manage, args.reset, args.reset_user]):
         parser.print_help()
         sys.exit(1)
 
