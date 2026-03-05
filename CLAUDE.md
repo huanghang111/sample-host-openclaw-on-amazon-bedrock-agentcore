@@ -22,7 +22,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
 - **Token Monitoring**: Lambda + DynamoDB (single-table) + CloudWatch custom metrics
 - **API Key Management**: Dual-mode storage — native file-based (S3-synced) or AWS Secrets Manager (KMS-encrypted, CloudTrail-auditable) via `api-keys` skill
-- **Security**: VPC endpoints, KMS CMK, Secrets Manager, cdk-nag
+- **Security**: VPC endpoints, KMS CMK, Secrets Manager, cdk-nag. `SECURITY.md` is a thin policy pointer; `docs/security.md` is the single source of truth for the full security architecture
 
 ## Architecture
 
@@ -160,6 +160,8 @@ openclaw-on-agentcore/
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
   docs/
     architecture.md               # Detailed architecture diagrams
+    architecture-detailed.md      # Technical deep-dive (sequence diagrams, container internals, data flows)
+    security.md                   # Complete security architecture (single source of truth — threat model, 10 defense layers, operations runbook)
 ```
 
 ## CDK Stacks (7 stacks)
