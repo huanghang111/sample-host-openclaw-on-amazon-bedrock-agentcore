@@ -222,7 +222,7 @@ curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}web
 
 ### 9. Verify
 
-Send a message to your Telegram bot. The first message triggers a cold start — the lightweight agent responds in ~10-15 seconds (with file storage and scheduling support) while OpenClaw initializes in the background (~2-4 minutes). After OpenClaw is ready, the full feature set is available. Subsequent messages in the same session are fast.
+Send a message to your Telegram bot. The first message triggers a cold start — the lightweight agent responds in ~10-15 seconds (with file storage and scheduling support) while OpenClaw initializes in the background (~1-2 minutes). After OpenClaw is ready, the full feature set is available. Subsequent messages in the same session are fast.
 
 ## Project Structure
 
@@ -423,8 +423,8 @@ Each user gets their own AgentCore microVM. When a user sends a message:
    - Restores `.openclaw/` workspace from S3 (background)
    - Starts credential refresh timer (45 min interval)
    - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately
-3. **Lightweight agent** (warm-up phase, ~5s to ~2-4min) runs an agentic loop with 17 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), ClawHub skill management (install/uninstall/list), and API key management (native CRUD, Secrets Manager CRUD, unified retrieval, migration). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
-4. **WebSocket bridge** (after OpenClaw ready, ~2-4min) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
+3. **Lightweight agent** (warm-up phase, ~5s to ~1-2min) runs an agentic loop with 17 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), ClawHub skill management (install/uninstall/list), and API key management (native CRUD, Secrets Manager CRUD, unified retrieval, migration). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
+4. **WebSocket bridge** (after OpenClaw ready, ~1-2min) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
 5. **Router Lambda** sends the response back to the channel (Telegram/Slack API). While waiting, it sends typing indicators (Telegram) and a one-time progress message after 30s (both channels) for long-running requests
 
 When the session idles (default 30 min), AgentCore terminates the microVM. Before shutdown, the SIGTERM handler saves `.openclaw/` to S3. The next message creates a fresh microVM and restores the workspace.
@@ -558,8 +558,8 @@ The agent also **proactively detects API keys** — if you paste something that 
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
-5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, and clawhub-manage tools — users can manage files, schedules, and install skills immediately)
-6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+5. **Warm-up phase** (t=~10s to ~1-2min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, and clawhub-manage tools — users can manage files, schedules, and install skills immediately)
+6. **Handoff** (~1-2min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
 7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 5 ClawHub skills (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer), sub-agent support, session management
 8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
@@ -594,7 +594,7 @@ Five ClawHub community skills are pre-installed at Docker build time:
 | `transcript` | YouTube video transcript extraction |
 | `task-decomposer` | Break complex requests into subtasks (spawns sub-agents) |
 
-During the warm-up phase (~first 2-4 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
+During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
 
 ### Webhook Security
 
@@ -694,7 +694,7 @@ The AgentCore contract server on port 8080 must start within seconds. If `entryp
 
 ### First message is slow (~4 minutes for full OpenClaw)
 
-This is expected for full OpenClaw initialization. However, the **lightweight agent shim** responds to the first message in ~10-15 seconds with support for file storage and cron scheduling tools. OpenClaw initializes in the background (~2-4 minutes) and takes over once ready. The Router Lambda sends a typing indicator to Telegram while waiting, and after 30 seconds sends a progress message ("Working on your request...") to both Telegram and Slack so users know the bot is still working. Subsequent messages in the same session are fast.
+This is expected for full OpenClaw initialization. However, the **lightweight agent shim** responds to the first message in ~10-15 seconds with support for file storage and cron scheduling tools. OpenClaw initializes in the background (~1-2 minutes) and takes over once ready. The Router Lambda sends a typing indicator to Telegram while waiting, and after 30 seconds sends a progress message ("Working on your request...") to both Telegram and Slack so users know the bot is still working. Subsequent messages in the same session are fast.
 
 ### Slack bot not responding
 
@@ -737,10 +737,10 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 
 | Limitation | Details |
 |---|---|
-| **Cold start time** | Lightweight agent responds in ~5-15s; full OpenClaw ready in ~2-4 min (plugin registration) |
+| **Cold start time** | Lightweight agent responds in ~5-15s; full OpenClaw ready in ~1-2 min (plugin registration) |
 | **Image size** | Max 3.75 MB per image (Bedrock Converse API limit) |
 | **Session timeout** | Sessions terminate after 30 min idle (configurable via `session_idle_timeout`) |
-| **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup (~2-4 min). During warm-up, built-in web_fetch/web_search tools are available |
+| **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup (~1-2 min). During warm-up, built-in web_fetch/web_search tools are available |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **No voice/video** | Only text and images supported; no audio or video messages |
 

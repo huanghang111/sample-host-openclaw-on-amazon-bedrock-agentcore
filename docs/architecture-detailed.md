@@ -59,7 +59,7 @@ flowchart TB
 | **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`), lazy initialization, routing (shim vs WebSocket bridge) |
 | **Lightweight Agent** | — | Warm-up shim during cold start; agentic loop with 13 tools via proxy → Bedrock (see below) |
 | **Bedrock Proxy** | 18790 | OpenAI-compatible API → Bedrock ConverseStream, Cognito identity, multimodal image handling |
-| **OpenClaw Gateway** | 18789 | Headless AI agent with full tools and ClawHub skills (available after ~2-4 min startup) |
+| **OpenClaw Gateway** | 18789 | Headless AI agent with full tools and ClawHub skills (available after ~1-2 min startup) |
 
 ## Data Flow
 
@@ -95,7 +95,7 @@ sequenceDiagram
         AC->>AC: STS AssumeRole (scoped S3 creds)
         AC->>AC: Start proxy (~5s)
         AC->>S3: Restore .openclaw/ (background)
-        AC->>AC: Start OpenClaw with scoped creds (background, ~2-4 min)
+        AC->>AC: Start OpenClaw with scoped creds (background, ~1-2 min)
     end
 
     alt Warm-up phase (OpenClaw not ready)
@@ -169,11 +169,11 @@ flowchart TB
         CONTRACT -->|"warm-up<br/>(OpenClaw not ready)"| SHIM
         CONTRACT -->|"full mode<br/>(OpenClaw ready)"| OPENCLAW
 
-        subgraph ShimBox["Warm-up Phase (~5s – ~2-4min)"]
+        subgraph ShimBox["Warm-up Phase (~5s – ~1-2min)"]
             SHIM["<b>Lightweight Agent</b><br/>Agentic loop (20 iters)<br/>17 tools · SSRF protection<br/>Appends warm-up footer"]
         end
 
-        subgraph FullBox["Full Mode (~2-4min onward)"]
+        subgraph FullBox["Full Mode (~1-2min onward)"]
             OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>5 ClawHub skills · Sub-agents"]
         end
 
@@ -252,24 +252,24 @@ gantt
 
     section Warm-up Phase
     Proxy starts (~5s)                  :active, t1, 1s, 5s
-    Lightweight agent handles messages  :active, t2, 5s, 150s
+    Lightweight agent handles messages  :active, t2, 5s, 90s
 
     section Background
-    OpenClaw starting (~2-4 min)        :crit, t3, 5s, 150s
+    OpenClaw starting (~1-2 min)        :crit, t3, 5s, 90s
     Workspace restore from S3           :done, t4, 1s, 10s
 
     section Full Mode
-    OpenClaw ready — handoff            :milestone, m1, 150s, 0
-    Full runtime handles messages       :t5, 150s, 200s
+    OpenClaw ready — handoff            :milestone, m1, 90s, 0
+    Full runtime handles messages       :t5, 90s, 140s
 ```
 
-**Warm-up phase** (t=~5s to ~2-4min): Lightweight agent responds with 13 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management). All responses include `"_Warm-up mode — after full startup..._"` footer.
+**Warm-up phase** (t=~5s to ~1-2min): Lightweight agent responds with 13 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management). All responses include `"_Warm-up mode — after full startup..._"` footer.
 
-**Full mode** (t=~2-4min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
+**Full mode** (t=~1-2min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
 
 ### Lightweight Agent Architecture
 
-The lightweight agent (`bridge/lightweight-agent.js`) provides immediate responsiveness during the ~2-4 minute OpenClaw cold start. It is NOT a replacement for OpenClaw — it's a shim that handles messages until the full runtime is ready.
+The lightweight agent (`bridge/lightweight-agent.js`) provides immediate responsiveness during the ~1-2 minute OpenClaw cold start. It is NOT a replacement for OpenClaw — it's a shim that handles messages until the full runtime is ready.
 
 | Property | Detail |
 |---|---|

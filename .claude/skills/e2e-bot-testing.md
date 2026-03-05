@@ -62,7 +62,7 @@ Cold Start Timeline
 t=0s       Container created (new microVM)
 t=~5s      Proxy ready → lightweight agent shim handles messages
            Responses include: "_Warm-up mode — after full startup..._"
-t=~2-4min  OpenClaw gateway ready → full runtime handles messages
+t=~1-2min  OpenClaw gateway ready → full runtime handles messages
            Responses have NO warm-up footer
            ClawHub skills available (transcript, deep-research, etc.)
 ```
@@ -70,7 +70,7 @@ t=~2-4min  OpenClaw gateway ready → full runtime handles messages
 | Phase | What Responds | Indicator | Typical Time |
 |-------|---------------|-----------|-------------|
 | **Warm-up** | Lightweight agent shim (proxy → Bedrock) | `"warm-up mode"` in response | 5-15s from cold start |
-| **Full** | OpenClaw gateway (WebSocket bridge) | No warm-up footer | 2-4 min from cold start |
+| **Full** | OpenClaw gateway (WebSocket bridge) | No warm-up footer | 1-2 min from cold start |
 
 ### How to detect which phase is active
 
@@ -394,7 +394,7 @@ If new log lines are added to `lambda/router/index.py`:
 
 | Operation | Default | Notes |
 |-----------|---------|-------|
-| Log tail | 300s | Accommodates cold start (~2-4 min) |
+| Log tail | 300s | Accommodates cold start (~1-2 min) |
 | Full startup poll | 600s | Waits for full OpenClaw (10 min max) |
 | Sub-agent skill timeout | 600s | Sub-agent skills may take several minutes |
 | Startup poll interval | 30s | Between status-check messages |

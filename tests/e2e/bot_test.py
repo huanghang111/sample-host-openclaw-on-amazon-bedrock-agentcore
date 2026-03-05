@@ -165,7 +165,7 @@ class TestFullStartup:
     this test waits for the full OpenClaw runtime to come online. It measures
     the timing of each phase:
       1. Webhook → warm-up response (lightweight agent shim, ~5-15s)
-      2. Warm-up → full OpenClaw ready (no more warm-up footer, ~2-4min)
+      2. Warm-up → full OpenClaw ready (no more warm-up footer, ~1-2min)
 
     The test confirms full startup by sending a message that exercises a
     ClawHub skill (only available after OpenClaw gateway is ready). A response
@@ -173,7 +173,7 @@ class TestFullStartup:
     """
 
     # Maximum time to wait for OpenClaw to finish starting (seconds).
-    # Typical cold start is ~2-4 min; 10 min covers slow regions/cold pulls.
+    # Typical cold start is ~1-2 min; 10 min covers slow regions/cold pulls.
     MAX_STARTUP_WAIT_S = 600
     POLL_INTERVAL_S = 30  # Time between status-check messages
 
@@ -302,7 +302,7 @@ class TestSubagent:
     OpenClaw subagents actually fired (not just that the skill responded).
 
     These tests are slower than other E2E tests because:
-    1. They may need to wait for full OpenClaw startup (~2-4 min)
+    1. They may need to wait for full OpenClaw startup (~1-2 min)
     2. Sub-agent skills take longer to execute than simple responses
 
     Run with: pytest tests/e2e/bot_test.py -v -k subagent

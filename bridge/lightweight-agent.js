@@ -2,7 +2,7 @@
  * Lightweight Agent Shim — Handles messages while OpenClaw starts up.
  *
  * NOT a replacement for OpenClaw — just a warm-up agent that provides
- * immediate responsiveness during the ~2-4 minute OpenClaw startup.
+ * immediate responsiveness during the ~1-2 minute OpenClaw startup.
  *
  * Calls the proxy at http://127.0.0.1:18790/v1/chat/completions (OpenAI format).
  * The proxy handles identity context, workspace files, and image support.
@@ -45,7 +45,7 @@ const SYSTEM_PROMPT =
   "For API key storage, offer two options: manage_api_key (native file-based, simpler) " +
   "or manage_secret (AWS Secrets Manager, more secure). Recommend manage_secret for " +
   "production keys. Use retrieve_api_key to look up keys from either backend.\n\n" +
-  "After full startup completes (~2-4 minutes), you gain additional capabilities: " +
+  "After full startup completes (~1-2 minutes), you gain additional capabilities: " +
   "deep research (multi-step analysis), YouTube transcripts, rich Telegram formatting, " +
   "task decomposition with sub-agents, and enhanced web reading via Jina.";
 
@@ -1411,7 +1411,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
         "I received your message but couldn't generate a response. Please try again.";
       const footer =
         "\n\n---\n" +
-        "_Warm-up mode — after full startup (~2-4 min), additional " +
+        "_Warm-up mode — after full startup (~1-2 min), additional " +
         "community skills come online: YouTube transcripts, deep research, " +
         "task decomposition with sub-agents, etc._";
       return text + footer;
@@ -1445,7 +1445,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
   console.warn("[shim] Max iterations reached");
   const fallbackFooter =
     "\n\n---\n" +
-    "_Warm-up mode — after full startup (~2-4 min), additional " +
+    "_Warm-up mode — after full startup (~1-2 min), additional " +
     "community skills come online: YouTube transcripts, deep research, " +
     "task decomposition with sub-agents, etc._";
   return "I ran into a limit processing your request. Please try rephrasing." + fallbackFooter;

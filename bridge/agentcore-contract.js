@@ -9,7 +9,7 @@
  *   1. Use pre-fetched secrets (fetched eagerly at boot)
  *   2. Start proxy + OpenClaw + workspace restore in parallel
  *   3. Once proxy is ready (~5s), route via lightweight agent shim
- *   4. Once OpenClaw is ready (~2-4 min), route via WebSocket bridge
+ *   4. Once OpenClaw is ready (~1-2 min), route via WebSocket bridge
  *
  * The lightweight agent handles messages immediately while OpenClaw starts.
  * Once OpenClaw is ready, all subsequent messages route through it seamlessly.

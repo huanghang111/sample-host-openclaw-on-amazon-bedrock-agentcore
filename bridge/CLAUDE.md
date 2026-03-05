@@ -13,7 +13,7 @@ Use these for real-time information, news, research, and reading web pages. They
 
 ## ClawHub Skills (Pre-installed)
 
-Five community skills are pre-installed from ClawHub (available after full startup ~2-4 min):
+Five community skills are pre-installed from ClawHub (available after full startup ~1-2 min):
 
 | Skill | Purpose |
 |---|---|
