@@ -565,11 +565,11 @@ class TestApiKeyManagement:
         secret_name = f"openclaw/user/{namespace}/{self.SM_KEY_NAME}"
         try:
             sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
-            print(f"\n  [cleanup] Force-deleted stale secret: {secret_name}")
+            print(f"\n  [cleanup] Force-deleted stale test secret: {self.SM_KEY_NAME}")
             time.sleep(2)  # Brief wait for deletion to propagate
         except ClientError as e:
             if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                print(f"\n  [cleanup] Warning: {e}")
+                print(f"\n  [cleanup] Warning deleting test secret: {e.response['Error']['Code']}")
 
         reset_session(e2e_config)
         time.sleep(2)
