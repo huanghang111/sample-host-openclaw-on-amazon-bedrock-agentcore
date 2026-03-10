@@ -21,6 +21,7 @@
     "cron_lambda_timeout_seconds": 600,
     "cron_lambda_memory_mb": 256,
     "enable_cloudtrail": false,
+    "enable_browser": false,
     "cron_lead_time_minutes": 5,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,
