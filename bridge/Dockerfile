@@ -30,6 +30,8 @@ RUN mkdir -p /app
 WORKDIR /app
 
 # Install AWS SDK and WebSocket library (production only)
+# Skip browser binary download — we only need playwright-core for CDP client (connectOverCDP)
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
                 @aws-sdk/client-bedrock-runtime \
