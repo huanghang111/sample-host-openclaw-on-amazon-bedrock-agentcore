@@ -1151,6 +1151,15 @@ class TestBrowserFeature:
             f"OpenClaw did not fully start within timeout. "
             f"Browser tests require full startup (elapsed={elapsed:.0f}s)"
         )
+        # Prime the LLM's context with browser skill awareness.
+        # OpenClaw may finish loading extraDirs skills slightly after HTTP readiness.
+        since_ms = int(time.time() * 1000)
+        post_webhook(
+            e2e_config,
+            "Do you have the agentcore-browser skill? "
+            "Just confirm yes or no, and list the browser commands.",
+        )
+        tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
 
     def test_browser_navigate(self, e2e_config, browser_enabled):
         """Agent navigates to a URL and returns the page title."""
