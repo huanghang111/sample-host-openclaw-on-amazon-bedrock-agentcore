@@ -398,6 +398,10 @@ The session receives SIGTERM, saves workspace to S3, and shuts down. The next me
 source .venv/bin/activate && cdk deploy --all --require-approval never
 ```
 
+> ⚠️ **Always run `./post-deploy.sh` after any CDK deploy.** This applies `auto-delete=no` tags to all
+> OpenClaw resources to prevent automated cleanup processes from deleting production infrastructure.
+> The script is gitignored (internal only) — if it doesn't exist, ask the user to restore it.
+
 ### Bridge Tests
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
