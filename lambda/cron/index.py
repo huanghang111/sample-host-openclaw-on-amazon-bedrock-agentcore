@@ -133,6 +133,30 @@ def get_or_create_session(user_id):
     return session_id
 
 
+def resolve_current_user_id(actor_id):
+    """Resolve the current internal userId from actorId via CHANNEL# PROFILE lookup.
+
+    The same Telegram/Slack user may have had multiple internal userIds over time
+    (session rotation). This ensures cron always uses the same session as the
+    user's active chat container rather than an old/stale session.
+
+    Falls back to None if lookup fails (caller should use payload userId as fallback).
+    """
+    if not actor_id:
+        return None
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"CHANNEL#{actor_id}", "SK": "PROFILE"}
+        )
+        if "Item" in resp and "userId" in resp["Item"]:
+            resolved = resp["Item"]["userId"]
+            logger.info("Resolved current userId=%s from actorId=%s", resolved, actor_id)
+            return resolved
+    except Exception as e:
+        logger.warning("Failed to resolve userId from actorId %s: %s", actor_id, e)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
@@ -585,11 +609,21 @@ def handler(event, context):
             "body": "Schedule ownership verification error",
         }
 
+    # Phase 1: Resolve current userId from actorId (ensures cron uses same session as chat).
+    # The payload userId may be from an older container; look up the current active userId
+    # via CHANNEL# PROFILE so cron and chat share the same AgentCore session/container.
+    current_user_id = resolve_current_user_id(actor_id) or user_id
+    if current_user_id != user_id:
+        logger.info(
+            "actorId=%s resolved to current userId=%s (payload had %s)",
+            actor_id, current_user_id, user_id,
+        )
+
     # Phase 1: Get or create session
-    session_id = get_or_create_session(user_id)
+    session_id = get_or_create_session(current_user_id)
 
     # Phase 2: Warm up the container if cold
-    warmup_ok = warmup_and_wait(session_id, user_id, actor_id, channel)
+    warmup_ok = warmup_and_wait(session_id, current_user_id, actor_id, channel)
     if not warmup_ok:
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "
@@ -601,7 +635,7 @@ def handler(event, context):
 
     # Phase 3: Execute the cron message
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    result = invoke_agentcore(session_id, "cron", user_id, actor_id, channel, cron_message)
+    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message)
     response_text = result.get("response", "No response from scheduled task.")
 
     # Phase 4: Deliver response to channel
