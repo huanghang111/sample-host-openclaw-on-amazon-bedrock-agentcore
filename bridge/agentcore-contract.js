@@ -761,6 +761,7 @@ async function init(userId, actorId, channel) {
       SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
       SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
       USER_ID: actorId,
+      INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
       CHANNEL: channel,
       OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
     };
