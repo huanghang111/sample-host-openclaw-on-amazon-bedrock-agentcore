@@ -656,35 +656,52 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
 # ---------------------------------------------------------------------------
 
 def _extract_text_from_content_blocks(text):
-    """Extract plain text if the response is a JSON array of content blocks.
+    """Extract plain text from content blocks anywhere in the response.
 
-    Recursively unwraps nested content blocks — subagent responses can produce
-    multiple layers of wrapping (e.g., subagent -> parent agent -> bridge).
+    Handles three cases:
+    1. Entire string is a JSON array: [{"type":"text","text":"..."}]
+    2. Content blocks embedded in surrounding text: "prefix[{...}]suffix"
+    3. Nested content blocks (subagent wrapping): recursively unwraps up to 10 levels
+
+    Scans for '[{' positions and attempts JSON parse at each to handle
+    complex nested/escaped content blocks from subagent responses.
     """
     if not text or not isinstance(text, str):
         return text
     result = text
+    decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
-        stripped = result.strip()
-        if not (stripped.startswith("[") and stripped.endswith("]")):
+        prev = result
+        # Scan for all '[{' positions and try to parse JSON arrays
+        rebuilt = []
+        i = 0
+        while i < len(result):
+            pos = result.find("[{", i)
+            if pos == -1:
+                rebuilt.append(result[i:])
+                break
+            rebuilt.append(result[i:pos])
+            # Try to parse a JSON array starting at pos
+            try:
+                blocks, end = decoder.raw_decode(result, pos)
+                if isinstance(blocks, list) and blocks:
+                    parts = [
+                        b.get("text", "")
+                        for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    if parts:
+                        rebuilt.append("".join(parts))
+                        i = end
+                        continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            # Not a valid content block array, keep the '[' and advance
+            rebuilt.append("[")
+            i = pos + 1
+        result = "".join(rebuilt)
+        if result == prev:
             break
-        try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
-            if isinstance(blocks, list) and blocks:
-                parts = [
-                    b.get("text", "")
-                    for b in blocks
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ]
-                if parts:
-                    unwrapped = "".join(parts)
-                    if unwrapped == result:
-                        break
-                    result = unwrapped
-                    continue
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        break
     return result
 
 
