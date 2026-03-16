@@ -91,8 +91,13 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
     Statement: [
       {
         Effect: "Allow",
-        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-        Resource: [`arn:aws:s3:::${bucket}/${namespace}/*`, `arn:aws:s3:::${bucket}`],
+        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+        Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
+      },
+      {
+        Effect: "Allow",
+        Action: "s3:ListBucket",
+        Resource: `arn:aws:s3:::${bucket}`,
       },
       // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
       // execution role; no further restriction needed in the session policy.
