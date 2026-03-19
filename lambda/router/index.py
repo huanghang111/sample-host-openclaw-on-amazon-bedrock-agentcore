@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import time
+import hashlib
 import uuid
 from urllib import request as urllib_request
 from urllib.parse import quote
