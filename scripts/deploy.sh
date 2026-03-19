@@ -3,7 +3,7 @@
 #
 # Three-phase deployment:
 #   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
-#   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build via CodeBuild, Runtime, Endpoint)
+#   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build, Runtime, Endpoint)
 #   Phase 3: CDK deploys dependent stacks (Router, Cron, TokenMonitoring)
 #
 # Usage:
@@ -12,11 +12,68 @@
 #   ./scripts/deploy.sh --runtime-only   # toolkit deploy only (Phase 2)
 #   ./scripts/deploy.sh --phase1         # Phase 1 only
 #   ./scripts/deploy.sh --phase3         # Phase 3 only (assumes runtime already deployed)
+#
+# Environment variables:
+#   BUILD_MODE          local-build (default) or codebuild
+#                       local-build: builds ARM64 container locally with Docker (recommended)
+#                       codebuild: builds in AWS CodeBuild (no Docker required, adds cost)
+#   CDK_DEFAULT_ACCOUNT AWS account ID (auto-detected if not set)
+#   CDK_DEFAULT_REGION  AWS region (falls back to cdk.json, then aws configure)
+#   AGENTCORE_CLI       Path to agentcore CLI (auto-detected)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# --- Build mode ---
+BUILD_MODE="${BUILD_MODE:-local-build}"
+
+# --- Pre-flight checks ---
+preflight() {
+  local errors=0
+
+  # AWS credentials
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' or set AWS_PROFILE."
+    errors=$((errors + 1))
+  fi
+
+  # CDK CLI
+  if ! command -v cdk &>/dev/null; then
+    echo "ERROR: AWS CDK CLI not found. Install with: npm install -g aws-cdk"
+    errors=$((errors + 1))
+  fi
+
+  # Python venv
+  if [ ! -f "$PROJECT_DIR/.venv/bin/activate" ]; then
+    echo "ERROR: Python venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
+    errors=$((errors + 1))
+  fi
+
+  # Docker (only for local-build)
+  if [ "$BUILD_MODE" = "local-build" ]; then
+    if ! command -v docker &>/dev/null; then
+      echo "ERROR: Docker not found (required for BUILD_MODE=local-build). Install Docker or set BUILD_MODE=codebuild."
+      errors=$((errors + 1))
+    elif ! docker info &>/dev/null 2>&1; then
+      echo "ERROR: Docker daemon not running. Start Docker or set BUILD_MODE=codebuild."
+      errors=$((errors + 1))
+    fi
+  fi
+
+  # Agentcore CLI
+  if ! command -v "${AGENTCORE_CLI:-agentcore}" &>/dev/null && [ ! -x "$HOME/.local/bin/agentcore" ]; then
+    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-cli"
+    errors=$((errors + 1))
+  fi
+
+  if [ "$errors" -gt 0 ]; then
+    echo ""
+    echo "Fix the above errors and re-run."
+    exit 1
+  fi
+}
 
 # Resolve account and region
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
@@ -46,9 +103,13 @@ if ! command -v "$AGENTCORE_CLI" &>/dev/null; then
   AGENTCORE_CLI="$HOME/.local/bin/agentcore"
 fi
 
+# Run pre-flight checks
+preflight
+
 echo "=== OpenClaw Hybrid Deploy ==="
-echo "  Account: $ACCOUNT"
-echo "  Region:  $REGION"
+echo "  Account:    $ACCOUNT"
+echo "  Region:     $REGION"
+echo "  Build mode: $BUILD_MODE"
 echo ""
 
 MODE="${1:-full}"
@@ -140,6 +201,24 @@ read_cdk_outputs() {
   echo "  S3 Bucket:      $USER_FILES_BUCKET"
 }
 
+# --- Check ARM64 build capability (for local-build mode) ---
+check_arm64_build() {
+  local arch
+  arch=$(uname -m)
+  if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+    return 0  # native ARM64, no QEMU needed
+  fi
+  # x86 host — check for ARM64 emulation via buildx/QEMU
+  if docker buildx ls 2>/dev/null | grep -q "linux/arm64"; then
+    return 0
+  fi
+  echo "WARNING: ARM64 emulation not available. Attempting to register QEMU..."
+  docker run --rm --privileged tonistiigi/binfmt --install arm64 || {
+    echo "ERROR: Could not set up ARM64 emulation. Install QEMU or use BUILD_MODE=codebuild."
+    exit 1
+  }
+}
+
 # --- Phase 2: Starter Toolkit deploy ---
 phase2_toolkit() {
   echo "=== Phase 2: Starter Toolkit deploy ==="
@@ -162,11 +241,19 @@ phase2_toolkit() {
     --deployment-type container \
     --non-interactive
 
-  # Deploy with environment variables
-  echo "--- Deploying runtime ---"
+  # Build deploy command based on BUILD_MODE
+  echo "--- Deploying runtime (mode: $BUILD_MODE) ---"
+  local deploy_flags=()
+  if [ "$BUILD_MODE" = "local-build" ]; then
+    check_arm64_build
+    deploy_flags+=("--local-build")
+  fi
+  # codebuild mode: no extra flags (default behavior)
+
   "$AGENTCORE_CLI" deploy \
     --agent openclaw_agent \
     --auto-update-on-conflict \
+    "${deploy_flags[@]}" \
     --env "AWS_REGION=$REGION" \
     --env "BEDROCK_MODEL_ID=$DEFAULT_MODEL_ID" \
     --env "GATEWAY_TOKEN_SECRET_ID=$GATEWAY_TOKEN_SECRET_ID" \

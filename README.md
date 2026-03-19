@@ -104,8 +104,9 @@ See [docs/security.md](docs/security.md) for the complete security architecture.
 - **AWS CLI** v2 configured with credentials (`aws sts get-caller-identity` should succeed)
 - **Node.js** >= 18 (for CDK CLI)
 - **Python** >= 3.11 (for CDK app)
-- **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx)
+- **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx). Not required if using `BUILD_MODE=codebuild`
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
+- **AgentCore Starter Toolkit** (`pip install bedrock-agentcore-toolkit`)
 - **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
@@ -165,7 +166,19 @@ The deploy script runs three phases automatically:
 2. **Phase 2 (Starter Toolkit)** — Reads CDK outputs, auto-generates `.bedrock_agentcore.yaml`, builds ARM64 container image, deploys AgentCore Runtime
 3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks (depend on Runtime ID from Phase 2)
 
-You can also run individual phases:
+The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore CLI) before starting.
+
+#### Build modes
+
+By default, the container image is built **locally** with Docker (`--local-build`). If you don't have Docker or prefer cloud builds, set `BUILD_MODE=codebuild`:
+
+| Mode | Command | Requires | Notes |
+|------|---------|----------|-------|
+| **local-build** (default) | `./scripts/deploy.sh` | Docker | Builds ARM64 image locally. On x86 hosts, uses QEMU emulation via Docker buildx |
+| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh` | — | Builds in AWS CodeBuild (no Docker needed, adds ~2 min + CodeBuild cost) |
+
+#### Running individual phases
+
 ```bash
 ./scripts/deploy.sh --phase1         # CDK foundation only
 ./scripts/deploy.sh --runtime-only   # Starter Toolkit only (Phase 2)
