@@ -130,6 +130,7 @@ phase1_cdk() {
   cdk deploy \
     OpenClawVpc \
     OpenClawSecurity \
+    OpenClawGuardrails \
     OpenClawAgentCore \
     OpenClawObservability \
     --require-approval never
