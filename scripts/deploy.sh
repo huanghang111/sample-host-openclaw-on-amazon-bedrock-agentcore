@@ -231,7 +231,7 @@ phase2_toolkit() {
   echo "--- Configuring agent ---"
   "$AGENTCORE_CLI" configure \
     --name openclaw_agent \
-    --entrypoint bridge/ \
+    --entrypoint bridge/agentcore-contract.js \
     --execution-role "$EXECUTION_ROLE_ARN" \
     --region "$REGION" \
     --vpc \
@@ -240,7 +240,23 @@ phase2_toolkit() {
     --idle-timeout "$SESSION_IDLE" \
     --max-lifetime "$SESSION_MAX" \
     --deployment-type container \
+    --language typescript \
     --non-interactive
+
+  # Fix: agentcore configure expands source_path to project root, but our
+  # Dockerfile COPY commands expect paths relative to bridge/. Patch it back.
+  local yaml_file="$PROJECT_DIR/.bedrock_agentcore.yaml"
+  if grep -q "source_path:.*$PROJECT_DIR$" "$yaml_file" 2>/dev/null; then
+    sed -i "s|source_path: $PROJECT_DIR$|source_path: $PROJECT_DIR/bridge|" "$yaml_file"
+    echo "  (patched source_path -> bridge/)"
+  fi
+
+  # Ensure the generated Dockerfile matches our actual Dockerfile
+  local gen_dockerfile="$PROJECT_DIR/.bedrock_agentcore/openclaw_agent/Dockerfile"
+  if [ -f "$gen_dockerfile" ] && [ -f "$PROJECT_DIR/bridge/Dockerfile" ]; then
+    cp "$PROJECT_DIR/bridge/Dockerfile" "$gen_dockerfile"
+    echo "  (synced Dockerfile from bridge/)"
+  fi
 
   # Build deploy command based on BUILD_MODE
   echo "--- Deploying runtime (mode: $BUILD_MODE) ---"
@@ -314,7 +330,7 @@ print(ba.get('agent_id', ''))
     ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
       --agent-runtime-id "$RUNTIME_ID" \
       --region "$REGION" \
-      --query 'runtimeEndpoints[0].runtimeEndpointId' \
+      --query "runtimeEndpoints[?name=='DEFAULT'].id | [0]" \
       --output text 2>/dev/null || echo "")
     echo "  Endpoint ID: $ENDPOINT_ID"
   fi
