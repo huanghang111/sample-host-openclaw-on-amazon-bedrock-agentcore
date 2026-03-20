@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import time
+import hashlib
 import uuid
 from urllib import request as urllib_request
 from urllib.parse import quote
@@ -424,7 +425,13 @@ def resolve_user(channel, channel_user_id, display_name=""):
         return None, False
 
     # 3. Create new user (conditional write to handle race conditions)
-    user_id = f"user_{uuid.uuid4().hex[:16]}"
+    # STABILITY NOTE: userId is deterministic (SHA-256 of channel_key) so that
+    # EventBridge schedules and DynamoDB CRON# records survive redeployments.
+    # Existing users registered before this fix keep their random userIds —
+    # the CHANNEL# PROFILE record is authoritative and never re-created.
+    # Do NOT delete or re-create CHANNEL# records; that would orphan all
+    # dependent records (USER# PROFILE, SESSION, CRON#).
+    user_id = f"user_{hashlib.sha256(channel_key.encode()).hexdigest()[:16]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     try:

@@ -282,7 +282,7 @@ def _extract_text_from_content_blocks(text):
         if result == prev:
             break
         try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
+            blocks = json.JSONDecoder(strict=False).decode(result)
             if isinstance(blocks, list) and blocks:
                 parts = [
                     b.get("text", "")
@@ -588,15 +588,27 @@ def handler(event, context):
         schedule_id, user_id, channel, channel_target,
     )
 
+    # Resolve current userId from actorId BEFORE ownership check.
+    # The payload userId may be stale (from before userId was made deterministic).
+    # Look up the current active userId via CHANNEL# PROFILE so the ownership check
+    # uses the correct userId, and cron shares the same session as chat.
+    current_user_id = resolve_current_user_id(actor_id) or user_id
+    if current_user_id != user_id:
+        logger.info(
+            "actorId=%s resolved to current userId=%s (payload had %s)",
+            actor_id, current_user_id, user_id,
+        )
+
     # Verify schedule ownership — cross-check DynamoDB CRON# record
+    # Use current_user_id (resolved from channel identity) for the lookup.
     try:
         cron_record = identity_table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"CRON#{schedule_id}"}
+            Key={"PK": f"USER#{current_user_id}", "SK": f"CRON#{schedule_id}"}
         ).get("Item")
         if not cron_record:
             logger.error(
                 "Schedule %s not owned by user %s — skipping execution",
-                schedule_id, user_id,
+                schedule_id, current_user_id,
             )
             return {
                 "statusCode": 403,
@@ -608,16 +620,6 @@ def handler(event, context):
             "statusCode": 500,
             "body": "Schedule ownership verification error",
         }
-
-    # Phase 1: Resolve current userId from actorId (ensures cron uses same session as chat).
-    # The payload userId may be from an older container; look up the current active userId
-    # via CHANNEL# PROFILE so cron and chat share the same AgentCore session/container.
-    current_user_id = resolve_current_user_id(actor_id) or user_id
-    if current_user_id != user_id:
-        logger.info(
-            "actorId=%s resolved to current userId=%s (payload had %s)",
-            actor_id, current_user_id, user_id,
-        )
 
     # Phase 1: Get or create session
     session_id = get_or_create_session(current_user_id)

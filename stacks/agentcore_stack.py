@@ -257,7 +257,7 @@ class AgentCoreStack(Stack):
                     "ecr:GetAuthorizationToken",
                 ],
                 resources=[
-                    f"arn:aws:ecr:{region}:{account}:repository/openclaw-bridge-*",
+                    f"arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
                     f"arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
                     f"arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
                 ],
@@ -404,7 +404,7 @@ class AgentCoreStack(Stack):
                         # Per-user API key storage in Secrets Manager (manage_secret tool)
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
                         # ECR pull (toolkit-managed repos — Starter Toolkit uses bedrock-agentcore- prefix)
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw-bridge-*",
+                        f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
                         f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
                         f"Resource::arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
                         # Bedrock Guardrails (wildcard for guardrail version changes)

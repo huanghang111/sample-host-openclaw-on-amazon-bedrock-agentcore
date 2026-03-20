@@ -81,22 +81,18 @@ class VpcStack(Stack):
             subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
         )
 
-        # Bedrock Runtime endpoint: Private DNS is intentionally kept enabled
-        # for regional model IDs (e.g. anthropic.claude-3-haiku-20240307-v1:0),
-        # which resolve to the VPC endpoint and stay on the AWS private network.
-        #
-        # Cross-region inference profiles (global.* / us.* / eu.* / ap.*) cannot
-        # be routed via the regional VPC endpoint — they require AWS's global
-        # routing layer. The proxy (agentcore-proxy.js) detects these profile
-        # prefixes and sets a custom endpoint URL on the BedrockRuntimeClient,
-        # which bypasses the Private DNS intercept and routes via NAT gateway.
-        # See: bridge/agentcore-proxy.js — isCrossRegionProfile() / bedrockClientOptions()
+        # Bedrock Runtime endpoint: Private DNS disabled so global/* cross-region
+        # inference profiles (e.g. global.anthropic.claude-sonnet-4-6) can route
+        # via NAT gateway to AWS's global routing layer. With private DNS enabled,
+        # bedrock-runtime.{region}.amazonaws.com resolves to the VPC endpoint IP
+        # even when the proxy sets a custom endpoint URL, blocking cross-region calls.
+        # Regional model calls still work — they route via NAT to the public endpoint.
         self.vpc.add_interface_endpoint(
             "BedrockRuntimeEndpoint",
             service=ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
             subnets=private_subnets,
             security_groups=[self.vpce_sg],
-            private_dns_enabled=True,  # Regional models use VPC endpoint; cross-region profiles bypass via proxy
+            private_dns_enabled=False,  # Disabled: cross-region profiles need NAT→global routing
         )
 
         interface_endpoints = {
