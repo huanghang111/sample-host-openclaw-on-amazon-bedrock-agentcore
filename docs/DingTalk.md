@@ -1,4 +1,4 @@
-# DingTalk Integration Design (Option B: ECS Fargate)
+# DingTalk Integration Design (ECS Fargate)
 
 ## Why ECS Fargate (not Lambda)
 
@@ -96,7 +96,8 @@ For picture messages: `msgtype: "picture"`, content has `downloadCode`.
 | `dingtalk-bridge/requirements.txt` | `dingtalk-stream`, `boto3` |
 | `dingtalk-bridge/Dockerfile` | Python 3.13-slim ARM64 container |
 | `stacks/dingtalk_stack.py` | CDK: ECS cluster, Fargate service, task def, IAM, SG, logging |
-| `scripts/setup-dingtalk.sh` | Store credentials in Secrets Manager, add user to allowlist |
+| `scripts/setup-dingtalk.sh` | Store credentials in Secrets Manager, add user to allowlist (Chinese UI) |
+| `docs/dingtalk-setup-zh.md` | Chinese setup guide for end users |
 
 ### Modified
 
@@ -106,6 +107,9 @@ For picture messages: `msgtype: "picture"`, content has `downloadCode`.
 | `app.py` | Import + instantiate `DingTalkStack` |
 | `stacks/cron_stack.py` | Accept + pass `dingtalk_token_secret_name` to cron Lambda env |
 | `lambda/cron/index.py` | Added `send_dingtalk_message()` + wired into `deliver_response()` |
+| `scripts/deploy.sh` | Added `OpenClawDingTalk` to Phase 3; fixed CodeBuild Dockerfile, orphaned resource cleanup, runtime ID extraction, endpoint API |
+| `.gitignore` | Added `.bedrock_agentcore.yaml` and `.bedrock_agentcore/` (deployment-specific) |
+| `cdk.json` | Model set to `global.anthropic.claude-opus-4-6-v1` (Claude 4.6), region `us-west-2` |
 
 ### Unchanged
 
@@ -155,18 +159,71 @@ Channel target format for `deliver_response()`:
 
 ## Deployment
 
-```bash
-# Phase 1: Deploy CDK stacks (creates ECS infrastructure + DingTalk secret)
-cdk deploy OpenClawSecurity OpenClawDingTalk OpenClawCron --require-approval never
+### Standard deployment (recommended)
 
-# Phase 2: Store credentials
+```bash
+# Full 3-phase deploy (CDK + AgentCore Starter Toolkit + CDK dependent stacks)
+./scripts/deploy.sh
+```
+
+This handles everything: VPC, Security, AgentCore Runtime (CodeBuild), Router,
+Cron, DingTalk ECS, TokenMonitoring. The deploy script automatically:
+- Checks/upgrades CDK bootstrap version
+- Cleans orphaned resources from previous deploys (dashboards, log groups, DynamoDB tables, S3 buckets)
+- Generates a CodeBuild-compatible Dockerfile (rewrites COPY paths with `bridge/` prefix)
+- Extracts runtime ID from `.bedrock_agentcore.yaml` and updates `cdk.json`
+- Defaults endpoint ID to `DEFAULT` when the control plane API returns `None`
+
+### Post-deploy: configure DingTalk
+
+```bash
+# Store DingTalk credentials and add yourself to the allowlist
 ./scripts/setup-dingtalk.sh
 
-# Phase 3: Force ECS service restart (pick up credentials)
+# Force ECS service restart (pick up new credentials immediately)
 aws ecs update-service --cluster openclaw-dingtalk \
   --service openclaw-dingtalk-bridge --force-new-deployment \
   --region $CDK_DEFAULT_REGION
 ```
+
+### User onboarding
+
+For many users, set `"registration_open": true` in `cdk.json` then `./scripts/deploy.sh --phase3`.
+For controlled access, use `./scripts/manage-allowlist.sh add dingtalk:<staffId>`.
+
+See `docs/dingtalk-setup-zh.md` for the full Chinese guide.
+
+## deploy.sh Fixes (learned the hard way)
+
+Issues discovered during fresh deployment testing and their fixes in `deploy.sh`:
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| CloudWatch dashboard "already exists" | Dashboards persist after stack deletion | `cleanup_orphaned_resources()` deletes orphaned dashboards before deploy |
+| Log group / DynamoDB table "already exists" | Explicit names + RETAIN policy survive stack deletion | Cleanup function handles `/openclaw/api-access`, `/openclaw/lambda/*`, `openclaw-identity` |
+| S3 bucket "already exists" | Non-empty buckets retained by CloudFormation | Cleanup deletes all object versions via boto3 then removes bucket |
+| CDK bootstrap too old (v27 < v30) | Early validation requires newer bootstrap | `ensure_bootstrap()` checks SSM parameter, auto-upgrades |
+| Dockerfile COPY paths wrong in CodeBuild | `agentcore configure` expands source_path to project root | `sed` rewrites COPY paths with `bridge/` prefix after configure |
+| Runtime ID extraction fails | `agentcore status` output not JSON-parseable | Read directly from `.bedrock_agentcore.yaml` |
+| Endpoint ID empty/"None" | Wrong API name + AWS CLI literal "None" | Fixed to `bedrock-agentcore-control list-agent-runtime-endpoints`, default to `DEFAULT` |
+| AgentCore SG blocks VPC deletion | ENIs managed by AgentCore persist ~24h | Known issue; use `--retain-resources` or `FORCE_DELETE_STACK`, tag VPC for later cleanup |
+
+## Teardown
+
+```bash
+# 1. Destroy Starter Toolkit resources
+agentcore destroy --agent openclaw_agent --force
+
+# 2. Destroy CDK stacks
+cdk destroy --all --force
+
+# 3. If VPC stack fails (AgentCore ENIs), force-delete retaining the SG:
+aws cloudformation delete-stack --stack-name OpenClawVpc \
+  --region us-west-2 --deletion-mode FORCE_DELETE_STACK
+```
+
+Note: AgentCore ENIs take up to 24 hours to release. The orphaned VPC/SG/subnets
+can be manually deleted afterward, or tagged for later cleanup.
 
 ## Scope Exclusions (v1)
 
