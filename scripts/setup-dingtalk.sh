@@ -1,22 +1,22 @@
 #!/bin/bash
-# Set up DingTalk Robot and add the deployer to the user allowlist.
+# 配置钉钉机器人并将部署者添加到用户白名单。
 #
-# Usage:
+# 用法：
 #   ./scripts/setup-dingtalk.sh
 #
-# This script:
-#   1. Guides you through creating a DingTalk Robot on the developer platform
-#   2. Prompts for DingTalk app credentials and stores them in Secrets Manager
-#   3. Prompts for your DingTalk staffId and adds you to the allowlist
+# 本脚本将：
+#   1. 指导你在钉钉开放平台创建机器人应用
+#   2. 提示输入钉钉应用凭证并存入 Secrets Manager
+#   3. 提示输入你的钉钉 staffId 并添加到白名单
 #
-# Prerequisites:
-#   - CDK stacks deployed (OpenClawSecurity, OpenClawDingTalk)
-#   - DingTalk enterprise internal app created at https://open.dingtalk.com/
-#   - aws cli configured with appropriate permissions
+# 前置条件：
+#   - 已完成 CDK 部署（OpenClawSecurity、OpenClawDingTalk）
+#   - 已在 https://open-dev.dingtalk.com/ 创建企业内部应用
+#   - aws cli 已配置且具有相应权限
 #
-# Environment:
-#   CDK_DEFAULT_REGION -- AWS region (default: us-west-2)
-#   AWS_PROFILE        -- AWS CLI profile (optional)
+# 环境变量：
+#   CDK_DEFAULT_REGION -- AWS 区域（默认：us-west-2）
+#   AWS_PROFILE        -- AWS CLI 配置文件（可选）
 
 set -euo pipefail
 
@@ -27,111 +27,111 @@ if [ -n "${AWS_PROFILE:-}" ]; then
     PROFILE_ARG="--profile $AWS_PROFILE"
 fi
 
-echo "=== OpenClaw DingTalk Setup ==="
+echo "=== OpenClaw 钉钉机器人配置 ==="
 echo ""
 
-# Support non-interactive mode via env vars:
+# 支持非交互模式（通过环境变量传入）：
 #   DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET, DINGTALK_STAFF_ID
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 if [ -n "${DINGTALK_CLIENT_ID:-}" ] && [ -n "${DINGTALK_CLIENT_SECRET:-}" ]; then
     NON_INTERACTIVE=true
 fi
 
-# --- Step 1: Instructions ---
-echo "Step 1: Create DingTalk Robot"
+# --- 步骤 1：创建钉钉机器人 ---
+echo "步骤 1：创建钉钉机器人"
 echo ""
-echo "  If you haven't already, create a DingTalk Robot:"
+echo "  如果你尚未创建机器人，请按以下步骤操作："
 echo ""
-echo "  1. Go to https://open.dingtalk.com/"
-echo "  2. Create an enterprise internal application"
-echo "  3. Add Robot capability"
-echo "  4. Set message receiving mode to Stream mode"
-echo "  5. Save the generated ClientId (AppKey) and ClientSecret (AppSecret)"
-echo "  6. Permissions -> add these scopes:"
-echo "       - qyapi_robot_sendmsg    (send robot messages)"
-echo "       - qyapi_chat_manage      (manage group chats, for group messaging)"
-echo "  7. Publish the application"
+echo "  1. 访问 https://open-dev.dingtalk.com/"
+echo "  2. 点击「应用开发」"
+echo "  3. 点击「一键创建 OpenClaw 机器人应用」"
+echo "  4. 确认消息接收模式为 Stream 模式"
+echo "  5. 进入「凭证与基础信息」，复制 ClientId（AppKey）和 ClientSecret（AppSecret）"
+echo "  6. 进入「权限管理」，添加以下权限："
+echo "       - qyapi_robot_sendmsg    （发送机器人消息）"
+echo "       - qyapi_chat_manage      （管理群聊，用于群消息发送）"
+echo "  7. 进入「版本管理与发布」，发布应用"
 echo ""
-echo "  IMPORTANT: The Robot must use Stream mode, not HTTP mode."
-echo "  IMPORTANT: The app must be published before it can receive messages."
+echo "  注意：机器人必须使用 Stream 模式，不支持 HTTP 模式。"
+echo "  注意：应用必须发布后才能接收消息。"
 echo ""
 if [ "$NON_INTERACTIVE" != "true" ]; then
-    read -rp "Press Enter once you've completed the above steps..."
+    read -rp "完成以上步骤后按回车继续..."
 fi
 echo ""
 
-# --- Step 2: Store credentials ---
-echo "Step 2: Store DingTalk credentials in Secrets Manager"
+# --- 步骤 2：存储凭证 ---
+echo "步骤 2：将钉钉凭证存入 Secrets Manager"
 echo ""
 CLIENT_ID="${DINGTALK_CLIENT_ID:-}"
 CLIENT_SECRET="${DINGTALK_CLIENT_SECRET:-}"
 if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
-    echo "Find these in your DingTalk app's 'Credentials & Basic Info' page."
+    echo "请在钉钉应用的「凭证与基础信息」页面获取以下信息。"
     echo ""
-    read -rp "Enter your DingTalk ClientId (AppKey): " CLIENT_ID
-    read -rp "Enter your DingTalk ClientSecret (AppSecret): " CLIENT_SECRET
+    read -rp "请输入 ClientId（AppKey）：" CLIENT_ID
+    read -rp "请输入 ClientSecret（AppSecret）：" CLIENT_SECRET
 fi
 
-echo "Storing credentials in Secrets Manager..."
+echo "正在将凭证存入 Secrets Manager..."
 aws secretsmanager update-secret \
     --secret-id openclaw/channels/dingtalk \
     --secret-string "{\"clientId\":\"${CLIENT_ID}\",\"clientSecret\":\"${CLIENT_SECRET}\"}" \
     --region "$REGION" $PROFILE_ARG
 
-echo "Credentials stored."
+echo "凭证已存储。"
 echo ""
 
-# --- Step 3: Verify credentials ---
-echo "Step 3: Verify credentials"
+# --- 步骤 3：验证凭证 ---
+echo "步骤 3：验证凭证"
 echo ""
-echo "Testing DingTalk API access..."
+echo "正在测试钉钉 API 连接..."
 VERIFY_RESULT=$(curl -s -X POST "https://api.dingtalk.com/v1.0/oauth2/accessToken" \
     -H "Content-Type: application/json" \
     -d "{\"appKey\":\"${CLIENT_ID}\",\"appSecret\":\"${CLIENT_SECRET}\"}" 2>&1)
 
 if echo "$VERIFY_RESULT" | grep -q "accessToken"; then
-    echo "Credentials verified successfully."
+    echo "凭证验证成功。"
 else
-    echo "WARNING: Credential verification failed. Response:"
+    echo "警告：凭证验证失败。返回结果："
     echo "  $VERIFY_RESULT"
     echo ""
-    echo "Common causes:"
-    echo "  - App not published (版本管理 -> 发布)"
-    echo "  - ClientId/ClientSecret incorrect"
-    echo "  - IP whitelist restrictions"
+    echo "常见原因："
+    echo "  - 应用尚未发布（版本管理 -> 发布）"
+    echo "  - ClientId 或 ClientSecret 输入错误"
+    echo "  - IP 白名单限制"
     echo ""
     if [ "$NON_INTERACTIVE" != "true" ]; then
-        read -rp "Continue anyway? (y/N): " CONFIRM
+        read -rp "是否继续？(y/N)：" CONFIRM
         if [[ "${CONFIRM:-n}" != "y" && "${CONFIRM:-n}" != "Y" ]]; then
-            echo "Aborted."
+            echo "已取消。"
             exit 1
         fi
     else
-        echo "Non-interactive mode: continuing despite verification failure."
+        echo "非交互模式：忽略验证失败，继续执行。"
     fi
 fi
 echo ""
 
-# --- Step 4: Add to allowlist ---
-echo "Step 4: Add yourself to the allowlist"
+# --- 步骤 4：添加白名单 ---
+echo "步骤 4：将你添加到白名单"
 echo ""
-echo "To find your DingTalk staffId:"
-echo "  - Message the bot from DingTalk"
-echo "  - The rejection reply will show your ID (e.g. dingtalk:manager1234)"
+echo "如何获取你的钉钉 staffId："
+echo "  - 在钉钉中给机器人发送任意消息"
+echo "  - 机器人会回复拒绝消息，其中包含你的 ID（例如 dingtalk:manager1234）"
 echo ""
-echo "If you don't know your staffId yet, you can skip this step and run:"
-echo "  ./scripts/manage-allowlist.sh add dingtalk:<your_staff_id>"
+echo "如果你暂时不知道 staffId，可以跳过此步骤，稍后运行："
+echo "  ./scripts/manage-allowlist.sh add dingtalk:<你的staffId>"
 echo ""
 STAFF_ID="${DINGTALK_STAFF_ID:-}"
 if [ -z "$STAFF_ID" ] && [ "$NON_INTERACTIVE" != "true" ]; then
-    read -rp "Enter your DingTalk staffId (or press Enter to skip): " STAFF_ID
+    read -rp "请输入你的钉钉 staffId（按回车跳过）：" STAFF_ID
 fi
 
 if [ -n "$STAFF_ID" ]; then
     CHANNEL_KEY="dingtalk:${STAFF_ID}"
     NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    echo "Adding $CHANNEL_KEY to allowlist..."
+    echo "正在将 $CHANNEL_KEY 添加到白名单..."
     aws dynamodb put-item \
         --table-name "$TABLE_NAME" \
         --region "$REGION" \
@@ -142,27 +142,27 @@ if [ -n "$STAFF_ID" ]; then
             \"channelKey\": {\"S\": \"${CHANNEL_KEY}\"},
             \"addedAt\": {\"S\": \"${NOW_ISO}\"}
         }"
-    echo "Added $CHANNEL_KEY to allowlist."
+    echo "已将 $CHANNEL_KEY 添加到白名单。"
 else
-    echo "Skipped allowlist setup."
+    echo "已跳过白名单配置。"
 fi
 
 echo ""
-echo "=== Setup complete ==="
+echo "=== 配置完成 ==="
 echo ""
-echo "  Credentials: stored in Secrets Manager (openclaw/channels/dingtalk)"
+echo "  凭证：已存入 Secrets Manager（openclaw/channels/dingtalk）"
 if [ -n "$STAFF_ID" ]; then
-    echo "  Allowlisted: dingtalk:${STAFF_ID}"
+    echo "  白名单：已添加 dingtalk:${STAFF_ID}"
 fi
 echo ""
-echo "The DingTalk Bridge ECS service will pick up the credentials automatically."
-echo "If the service is already running, it will use the new credentials"
-echo "within 15 minutes (secret cache TTL) or after the next task restart."
+echo "钉钉桥接 ECS 服务会自动加载新凭证。"
+echo "如果服务已在运行，凭证将在 15 分钟内生效（缓存 TTL），"
+echo "或在下次任务重启后立即生效。"
 echo ""
-echo "To force restart the ECS service:"
+echo "如需立即重启 ECS 服务："
 echo "  aws ecs update-service --cluster openclaw-dingtalk \\"
 echo "    --service openclaw-dingtalk-bridge --force-new-deployment \\"
 echo "    --region $REGION"
 echo ""
-echo "To add more users later:"
-echo "  ./scripts/manage-allowlist.sh add dingtalk:<staff_id>"
+echo "如需添加更多用户："
+echo "  ./scripts/manage-allowlist.sh add dingtalk:<staffId>"
