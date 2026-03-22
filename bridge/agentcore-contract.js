@@ -1025,10 +1025,10 @@ function extractTextFromContent(content) {
         return extractTextFromContent(leading + text);
       }
     }
-    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"...")
+    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"..." or "[{\"")
     // These are partial content blocks from streaming that shouldn't leak as response text
     if (trimmed.startsWith("[{") && !trimmed.endsWith("]")) {
-      if (/^\[\{\s*"type"\s*:/.test(trimmed) || trimmed === "[{") {
+      if (/^\[\{\s*"/.test(trimmed) || trimmed === "[{") {
         return "";
       }
     }

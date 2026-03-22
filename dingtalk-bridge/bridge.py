@@ -22,6 +22,7 @@ from urllib import request as urllib_request
 
 import boto3
 from botocore.config import Config
+import botocore.exceptions
 from botocore.exceptions import ClientError
 import dingtalk_stream
 from dingtalk_stream import AckMessage
@@ -279,6 +280,10 @@ def redeem_bind_code(code: str, channel: str, channel_user_id: str, display_name
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
+MAX_INVOKE_RETRIES = 3
+INVOKE_RETRY_DELAYS = [5, 15, 30]  # seconds between retries (cold start can take 30-60s)
+
+
 def invoke_agent_runtime(session_id: str, user_id: str, actor_id: str, message) -> dict:
     payload = json.dumps({
         "action": "chat",
@@ -287,31 +292,45 @@ def invoke_agent_runtime(session_id: str, user_id: str, actor_id: str, message) 
         "channel": "dingtalk",
         "message": message,
     }).encode()
-    try:
-        logger.info("Invoking AgentCore: session=%s user=%s", session_id, user_id)
-        resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
-            runtimeSessionId=session_id,
-            runtimeUserId=actor_id,
-            payload=payload,
-            contentType="application/json",
-            accept="application/json",
-        )
-        MAX_RESPONSE_BYTES = 500_000
-        body = resp.get("response")
-        if body:
-            body_bytes = body.read(MAX_RESPONSE_BYTES + 1) if hasattr(body, "read") else str(body).encode()[:MAX_RESPONSE_BYTES]
-            body_text = body_bytes.decode("utf-8", errors="replace")[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response len=%d first200=%s", len(body_text), body_text[:200])
-            try:
-                return json.loads(body_text)
-            except json.JSONDecodeError:
-                return {"response": body_text}
-        return {"response": "No response from agent."}
-    except Exception as e:
-        logger.error("AgentCore invocation failed: %s", e, exc_info=True)
-        return {"response": "Sorry, I'm having trouble right now. Please try again later."}
+
+    last_error = None
+    for attempt in range(MAX_INVOKE_RETRIES):
+        try:
+            logger.info("Invoking AgentCore: session=%s user=%s attempt=%d", session_id, user_id, attempt + 1)
+            resp = agentcore_client.invoke_agent_runtime(
+                agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
+                qualifier=AGENTCORE_QUALIFIER,
+                runtimeSessionId=session_id,
+                runtimeUserId=actor_id,
+                payload=payload,
+                contentType="application/json",
+                accept="application/json",
+            )
+            MAX_RESPONSE_BYTES = 500_000
+            body = resp.get("response")
+            if body:
+                body_bytes = body.read(MAX_RESPONSE_BYTES + 1) if hasattr(body, "read") else str(body).encode()[:MAX_RESPONSE_BYTES]
+                body_text = body_bytes.decode("utf-8", errors="replace")[:MAX_RESPONSE_BYTES]
+                logger.info("AgentCore response len=%d first200=%s", len(body_text), body_text[:200])
+                try:
+                    return json.loads(body_text)
+                except json.JSONDecodeError:
+                    return {"response": body_text}
+            return {"response": "No response from agent."}
+        except (botocore.exceptions.ConnectionClosedError, ConnectionResetError) as e:
+            last_error = e
+            if attempt < MAX_INVOKE_RETRIES - 1:
+                delay = INVOKE_RETRY_DELAYS[attempt]
+                logger.warning("AgentCore connection reset (attempt %d/%d), retrying in %ds: %s",
+                               attempt + 1, MAX_INVOKE_RETRIES, delay, e)
+                time.sleep(delay)
+            else:
+                logger.error("AgentCore invocation failed after %d attempts: %s", MAX_INVOKE_RETRIES, e, exc_info=True)
+        except Exception as e:
+            logger.error("AgentCore invocation failed: %s", e, exc_info=True)
+            return {"response": "Sorry, I'm having trouble right now. Please try again later."}
+
+    return {"response": "Sorry, I'm having trouble right now. Please try again later."}
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +364,7 @@ def _extract_text_from_content_blocks(text: str) -> str:
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
             remainder = result[pos:]
-            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
+            if re.match(r'^\[\{\s*"', remainder) or remainder.strip() == "[{":
                 break
             rebuilt.append("[")
             i = pos + 1
@@ -621,6 +640,8 @@ def _process_message_inner(data: dict) -> None:
     result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, agent_message)
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
+    if not response_text or not response_text.strip():
+        response_text = "Sorry, I received an empty response. Please try again."
     logger.info("Response len=%d first200=%s", len(response_text), response_text[:200])
 
     # Send reply

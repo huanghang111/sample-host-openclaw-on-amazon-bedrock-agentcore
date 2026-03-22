@@ -128,6 +128,8 @@ if [ -z "$STAFF_ID" ] && [ "$NON_INTERACTIVE" != "true" ]; then
 fi
 
 if [ -n "$STAFF_ID" ]; then
+    # Strip "dingtalk:" prefix if user included it
+    STAFF_ID="${STAFF_ID#dingtalk:}"
     CHANNEL_KEY="dingtalk:${STAFF_ID}"
     NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
