@@ -4,7 +4,7 @@
 # Three-phase deployment:
 #   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
 #   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build via CodeBuild, Runtime, Endpoint)
-#   Phase 3: CDK deploys dependent stacks (Router, Cron, TokenMonitoring)
+#   Phase 3: CDK deploys dependent stacks (Router, Cron, DingTalk, TokenMonitoring)
 #
 # Usage:
 #   ./scripts/deploy.sh                  # full 3-phase deploy
@@ -50,11 +50,39 @@ activate_venv() {
   fi
 }
 
+# --- Pre-deploy: clean up orphaned resources that block CloudFormation ---
+cleanup_orphaned_resources() {
+  echo "--- Checking for orphaned resources ---"
+  # CloudWatch dashboards are not deleted by CloudFormation stack deletion,
+  # causing "already exists" early validation errors on fresh deploys.
+  for dashboard in "OpenClaw-Operations" "OpenClaw-Token-Analytics"; do
+    if aws cloudwatch get-dashboard --dashboard-name "$dashboard" --region "$REGION" &>/dev/null; then
+      echo "  Deleting orphaned dashboard: $dashboard"
+      aws cloudwatch delete-dashboards --dashboard-names "$dashboard" --region "$REGION"
+    fi
+  done
+}
+
+# --- Ensure CDK bootstrap is up to date ---
+ensure_bootstrap() {
+  BOOTSTRAP_VERSION=$(aws ssm get-parameter \
+    --name /cdk-bootstrap/hnb659fds/version \
+    --region "$REGION" \
+    --query 'Parameter.Value' --output text 2>/dev/null || echo "0")
+  if [ "$BOOTSTRAP_VERSION" -lt 30 ] 2>/dev/null; then
+    echo "--- CDK bootstrap version $BOOTSTRAP_VERSION < 30, upgrading ---"
+    cdk bootstrap "aws://$ACCOUNT/$REGION"
+  fi
+}
+
 # --- Phase 1: CDK foundation stacks ---
 phase1_cdk() {
   echo "=== Phase 1: CDK foundation stacks ==="
   cd "$PROJECT_DIR"
   activate_venv
+
+  ensure_bootstrap
+  cleanup_orphaned_resources
 
   cdk deploy \
     OpenClawVpc \
@@ -141,7 +169,7 @@ phase2_toolkit() {
   echo "--- Configuring agent ---"
   "$AGENTCORE_CLI" configure \
     --name openclaw_agent \
-    --entrypoint bridge/ \
+    --entrypoint bridge/agentcore-contract.js \
     --execution-role "$EXECUTION_ROLE_ARN" \
     --region "$REGION" \
     --vpc \
@@ -152,7 +180,24 @@ phase2_toolkit() {
     --deployment-type container \
     --non-interactive
 
-  # Deploy with environment variables
+  # Fix: agentcore configure expands source_path to project root, but the
+  # bridge/Dockerfile COPY commands are relative to bridge/. Generate a modified
+  # Dockerfile with bridge/-prefixed paths for CodeBuild (project root context).
+  echo "--- Generating CodeBuild-compatible Dockerfile ---"
+  TOOLKIT_DOCKERFILE="$PROJECT_DIR/.bedrock_agentcore/openclaw_agent/Dockerfile"
+  sed -e 's|^COPY agentcore-|COPY bridge/agentcore-|' \
+      -e 's|^COPY lightweight-|COPY bridge/lightweight-|' \
+      -e 's|^COPY workspace-sync|COPY bridge/workspace-sync|' \
+      -e 's|^COPY cloudwatch-logger|COPY bridge/cloudwatch-logger|' \
+      -e 's|^COPY scoped-credentials|COPY bridge/scoped-credentials|' \
+      -e 's|^COPY force-ipv4|COPY bridge/force-ipv4|' \
+      -e 's|^COPY skills/|COPY bridge/skills/|' \
+      -e 's|^COPY CLAUDE\.md|COPY bridge/CLAUDE.md|' \
+      -e 's|^COPY entrypoint|COPY bridge/entrypoint|' \
+      "$PROJECT_DIR/bridge/Dockerfile" > "$TOOLKIT_DOCKERFILE"
+  echo "  Dockerfile written to $TOOLKIT_DOCKERFILE"
+
+  # Deploy with environment variables (CodeBuild, default mode)
   echo "--- Deploying runtime ---"
   "$AGENTCORE_CLI" deploy \
     --agent openclaw_agent \
@@ -175,50 +220,39 @@ phase2_toolkit() {
     --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
     --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID"
 
-  # Read runtime ID and endpoint ID from toolkit
+  # Read runtime ID from .bedrock_agentcore.yaml (most reliable source)
   echo "--- Reading runtime info ---"
-  TOOLKIT_STATUS=$("$AGENTCORE_CLI" status --agent openclaw_agent --verbose 2>&1 || true)
-
-  # Extract runtime_id from status output
-  RUNTIME_ID=$(echo "$TOOLKIT_STATUS" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(data.get('agent_id', data.get('runtime_id', '')))
-except:
-    import re
-    text = sys.stdin.read() if not 'data' in dir() else ''
-    m = re.search(r'agent_id[\":\s]+([a-zA-Z0-9]+)', text)
-    print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-
-  # Fallback: read from .bedrock_agentcore.yaml
-  if [ -z "$RUNTIME_ID" ]; then
-    RUNTIME_ID=$(python3 -c "
+  RUNTIME_ID=$(python3 -c "
 import yaml
 with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
     cfg = yaml.safe_load(f)
 agent = cfg.get('agents', {}).get('openclaw_agent', {})
 ba = agent.get('bedrock_agentcore', {})
-print(ba.get('agent_id', ''))
+rid = ba.get('agent_id', '') or ''
+print(rid)
 " 2>/dev/null || echo "")
-  fi
 
   if [ -z "$RUNTIME_ID" ]; then
-    echo "WARNING: Could not extract runtime_id from toolkit. You may need to set it manually in cdk.json."
+    echo "WARNING: Could not extract runtime_id from toolkit config. You may need to set it manually in cdk.json."
   else
     echo "  Runtime ID: $RUNTIME_ID"
   fi
 
-  # Get endpoint ID
+  # Get endpoint ID via control plane API
   ENDPOINT_ID=""
   if [ -n "$RUNTIME_ID" ]; then
-    ENDPOINT_ID=$(aws bedrock-agentcore list-runtime-endpoints \
+    ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
       --agent-runtime-id "$RUNTIME_ID" \
       --region "$REGION" \
-      --query 'runtimeEndpoints[0].runtimeEndpointId' \
+      --query 'runtimeEndpoints[0].id' \
       --output text 2>/dev/null || echo "")
-    echo "  Endpoint ID: $ENDPOINT_ID"
+    # AWS CLI returns "None" for null values — treat as empty
+    if [ "$ENDPOINT_ID" = "None" ] || [ -z "$ENDPOINT_ID" ]; then
+      ENDPOINT_ID="DEFAULT"
+      echo "  Endpoint ID: $ENDPOINT_ID (assumed default)"
+    else
+      echo "  Endpoint ID: $ENDPOINT_ID"
+    fi
   fi
 
   # Update cdk.json with runtime info
@@ -247,6 +281,8 @@ phase3_cdk() {
   cd "$PROJECT_DIR"
   activate_venv
 
+  cleanup_orphaned_resources
+
   # Verify runtime_id is set
   RUNTIME_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_id',''))")
   if [ -z "$RUNTIME_ID" ] || [ "$RUNTIME_ID" = "PLACEHOLDER" ]; then
@@ -257,6 +293,7 @@ phase3_cdk() {
   cdk deploy \
     OpenClawRouter \
     OpenClawCron \
+    OpenClawDingTalk \
     OpenClawTokenMonitoring \
     --require-approval never
 
@@ -288,9 +325,7 @@ esac
 echo "=== Deploy complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Store your Telegram bot token:"
-echo "     aws secretsmanager update-secret --secret-id openclaw/channels/telegram \\"
-echo "       --secret-string 'YOUR_BOT_TOKEN' --region $REGION"
-echo ""
-echo "  2. Set up webhook:"
-echo "     ./scripts/setup-telegram.sh"
+echo "  1. Set up Telegram:  ./scripts/setup-telegram.sh"
+echo "  2. Set up Slack:     ./scripts/setup-slack.sh"
+echo "  3. Set up Feishu:    ./scripts/setup-feishu.sh"
+echo "  4. Set up DingTalk:  ./scripts/setup-dingtalk.sh"
