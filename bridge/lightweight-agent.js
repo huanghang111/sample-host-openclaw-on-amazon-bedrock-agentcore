@@ -1377,13 +1377,14 @@ function callProxy(messages) {
  * @param {string} userId - The user's actor ID (for tool execution)
  * @returns {Promise<string>} - The assistant's text response
  */
-async function chat(userMessage, userId, deadlineMs = 0) {
+async function chat(userMessage, userId, deadlineMs = 0, history = []) {
   // Convert actorId (colon format e.g. "telegram:123") to namespace (underscore format)
   // for tool compatibility — skill scripts expect "telegram_123" format.
   const namespace = userId.replace(/:/g, "_");
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
+    ...history,
     { role: "user", content: userMessage },
   ];
 

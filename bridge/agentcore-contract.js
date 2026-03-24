@@ -91,6 +91,12 @@ let activeTaskCount = 0;
 let messageQueue = [];
 let processingMessage = false;
 
+// Warm-up conversation history — accumulated during lightweight agent phase,
+// injected into OpenClaw on first post-handoff message for continuity.
+const MAX_WARMUP_HISTORY = 20; // 10 exchanges max
+let warmupHistory = [];
+const WARMUP_FOOTER_MARKER = "\n\n---\n_Warm-up mode";
+
 /**
  * Write current actorId and channel to a shared file so the proxy process
  * can pick up cross-channel identity changes (the proxy's env vars are
@@ -1322,6 +1328,32 @@ async function bridgeMessage(message, timeoutMs = 560000) {
 }
 
 /**
+ * Strip the warm-up footer from a lightweight agent response
+ * before storing in warmupHistory (OpenClaw shouldn't see this metadata).
+ */
+function stripWarmupFooter(text) {
+  if (!text) return "";
+  const idx = text.indexOf(WARMUP_FOOTER_MARKER);
+  return idx >= 0 ? text.slice(0, idx) : text;
+}
+
+/**
+ * Format accumulated warm-up history as a context prefix for OpenClaw.
+ * Injected into the first post-handoff message so OpenClaw has continuity.
+ */
+function formatWarmupHistory(history) {
+  if (!history || history.length === 0) return "";
+  const lines = history.map(
+    (m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`,
+  );
+  return (
+    "[Previous conversation during startup — please maintain context continuity:]\n" +
+    lines.join("\n\n") +
+    "\n\n[Current message:]\n"
+  );
+}
+
+/**
  * Build bridge text from message payload.
  * Handles structured messages with images and plain text.
  */
@@ -1597,8 +1629,18 @@ const server = http.createServer(async (req, res) => {
             // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
+              // Inject warm-up conversation history on first OpenClaw message
+              let messageToBridge = bridgeText;
+              if (warmupHistory.length > 0) {
+                messageToBridge =
+                  formatWarmupHistory(warmupHistory) + bridgeText;
+                warmupHistory = [];
+                console.log(
+                  "[contract] Injected warm-up history into first OpenClaw message",
+                );
+              }
               try {
-                responseText = await enqueueMessage(bridgeText);
+                responseText = await enqueueMessage(messageToBridge);
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
@@ -1625,7 +1667,20 @@ const server = http.createServer(async (req, res) => {
               // Warm-up shim path — lightweight agent via proxy
               console.log("[contract] Routing via lightweight agent (warm-up)");
               try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
+                responseText = await agent.chat(
+                  bridgeText,
+                  actorId,
+                  Date.now() + 560000,
+                  warmupHistory,
+                );
+                // Accumulate history for OpenClaw handoff (strip warm-up footer)
+                if (warmupHistory.length < MAX_WARMUP_HISTORY) {
+                  warmupHistory.push({ role: "user", content: bridgeText });
+                  warmupHistory.push({
+                    role: "assistant",
+                    content: stripWarmupFooter(responseText),
+                  });
+                }
               } catch (agentErr) {
                 responseText = `I'm having trouble right now. Please try again in a moment.`;
                 console.error(
