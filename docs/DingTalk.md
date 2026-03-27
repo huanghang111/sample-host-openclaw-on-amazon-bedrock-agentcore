@@ -38,15 +38,17 @@ This is fundamentally different from Telegram/Slack/Feishu which use inbound HTT
 1. DingTalk Stream delivers callback message via WebSocket
 2. Bridge ACKs immediately (DingTalk requires fast ACK)
 3. Background thread processes:
-   a. Extract senderId, conversationType, text/image
+   a. Extract senderId, conversationType, text/image/file/video
    b. Dedup check (in-memory, 5min TTL)
    c. Handle bind/link commands
    d. `resolve_user("dingtalk", senderId)` via DynamoDB
    e. `get_or_create_session(userId)` via DynamoDB
-   f. If image: download from DingTalk API, upload to S3, build structured message
-   g. `invoke_agent_runtime(session, userId, actorId, "dingtalk", message)`
-   h. Extract response text (handle content blocks)
-   i. Send reply via DingTalk Robot API
+   f. If image: download from DingTalk API, upload to S3, build multimodal structured message
+   g. If file/video: download from DingTalk API, upload to S3, build text message with file metadata
+   h. `invoke_agent_runtime(session, userId, actorId, "dingtalk", message)`
+   i. Extract response text (handle content blocks)
+   j. Extract `[SCREENSHOT:key]` markers → deliver screenshots as images
+   k. Send text reply via DingTalk Robot API
 
 ## DingTalk APIs Used
 
@@ -55,7 +57,7 @@ This is fundamentally different from Telegram/Slack/Feishu which use inbound HTT
 | Get access token | `api.dingtalk.com/v1.0/oauth2/accessToken` | POST |
 | Send DM | `api.dingtalk.com/v1.0/robot/oToMessages/batchSend` | POST |
 | Send to group | `api.dingtalk.com/v1.0/robot/groupMessages/send` | POST |
-| Download image | `api.dingtalk.com/v1.0/robot/messageFiles/download` | POST |
+| Get file download URL | `api.dingtalk.com/v1.0/robot/messageFiles/download` | POST |
 
 ## DingTalk Stream Protocol
 
@@ -84,7 +86,9 @@ The `dingtalk-stream` Python package handles:
 }
 ```
 
-For picture messages: `msgtype: "picture"`, content has `downloadCode`.
+For picture messages: `msgtype: "picture"`, content has `downloadCode` and `pictureDownloadCode`.
+For file messages: `msgtype: "file"`, content has `downloadCode` and `fileName`.
+For video messages: `msgtype: "video"`, content has `downloadCode` and `duration`.
 
 ## Files
 
@@ -92,7 +96,8 @@ For picture messages: `msgtype: "picture"`, content has `downloadCode`.
 
 | File | Purpose |
 |------|---------|
-| `dingtalk-bridge/bridge.py` | Main service: Stream client, user resolution, AgentCore invocation, reply, image handling, health check |
+| `dingtalk-bridge/bridge.py` | Main service: Stream client, user resolution, AgentCore invocation, reply, image/file/video handling, screenshot delivery, health check |
+| `dingtalk-bridge/test_media.py` | Unit tests for media download, upload, screenshot delivery (28 tests) |
 | `dingtalk-bridge/requirements.txt` | `dingtalk-stream`, `boto3` |
 | `dingtalk-bridge/Dockerfile` | Python 3.13-slim ARM64 container |
 | `stacks/dingtalk_stack.py` | CDK: ECS cluster, Fargate service, task def, IAM, SG, logging |
@@ -207,6 +212,12 @@ Issues discovered during fresh deployment testing and their fixes in `deploy.sh`
 | Runtime ID extraction fails | `agentcore status` output not JSON-parseable | Read directly from `.bedrock_agentcore.yaml` |
 | Endpoint ID empty/"None" | Wrong API name + AWS CLI literal "None" | Fixed to `bedrock-agentcore-control list-agent-runtime-endpoints`, default to `DEFAULT` |
 | AgentCore SG blocks VPC deletion | ENIs managed by AgentCore persist ~24h | Known issue; use `--retain-resources` or `FORCE_DELETE_STACK`, tag VPC for later cleanup |
+| S3 bucket "NoSuchBucket" despite CDK showing CREATE_COMPLETE | Bucket deleted externally but CDK RETAIN policy doesn't recreate | `verify_s3_bucket()` in deploy.sh recreates bucket with full CDK-matching config |
+| S3 presigned URL "InvalidToken" | Bucket recreated without KMS encryption; scoped credentials expect KMS context | `verify_s3_bucket()` checks and repairs encryption, versioning, SSL policy, lifecycle |
+| DingTalk image download timeout | `messageFiles/download` returns Alibaba OSS URL using HTTP (port 80), SG only allows 443 | Bridge upgrades `http://` to `https://` (OSS supports both) |
+| DingTalk download returns JSON not image bytes | `messageFiles/download` is a two-step API: returns `{downloadUrl}` JSON, not file bytes | Bridge calls API for URL, then fetches bytes from the URL separately |
+| `agentcore` CLI not found | Not in PATH or `~/.local/bin/`, but in `.venv/bin/` | Deploy script checks PATH, `.venv/bin/`, `~/.local/bin/` in order |
+| DingTalk log group blocks redeploy | `/openclaw/dingtalk-bridge` persists after stack deletion | Added to `cleanup_orphaned_resources()` |
 
 ## Teardown
 
@@ -225,12 +236,45 @@ aws cloudformation delete-stack --stack-name OpenClawVpc \
 Note: AgentCore ENIs take up to 24 hours to release. The orphaned VPC/SG/subnets
 can be manually deleted afterward, or tagged for later cleanup.
 
+## Media Support
+
+### Receiving from users (user → bot)
+- **Images** (`picture` msgtype): Two-step download (get OSS URL via `messageFiles/download` API, then fetch bytes), uploaded to S3, sent to Bedrock as multimodal content
+- **Files** (`file` msgtype): Same two-step download, uploaded to S3 under `{namespace}/_uploads/file_*`, agent notified with file name/type/path (max 20 MB)
+- **Videos** (`video` msgtype): Same two-step download, uploaded to S3 under `{namespace}/_uploads/vid_*`, agent notified with duration/type/path (max 20 MB)
+
+### Download Flow (two-step)
+```
+1. POST api.dingtalk.com/v1.0/robot/messageFiles/download
+   Body: {"downloadCode": "...", "robotCode": "..."}
+   Response: {"downloadUrl": "https://wukong-file-im-*.oss-cn-*.aliyuncs.com/..."}
+
+2. GET the downloadUrl → actual file bytes
+   Note: URL may be HTTP — bridge upgrades to HTTPS (SG only allows 443)
+```
+
+### Sending to users (bot → user)
+- **Text**: Via `sampleText` msgKey (chunked at 20,000 chars)
+- **Screenshots**: `[SCREENSHOT:key]` markers in AgentCore responses are extracted, images fetched from S3, sent via `sampleImageMsg` with presigned S3 URLs (1h expiry)
+- **Images**: `[SEND_FILE:path]` markers with image extensions (.jpg/.png/.gif/.webp) sent inline via `sampleImageMsg` with presigned URL
+- **Files/Videos**: `[SEND_FILE:path]` markers with other extensions sent as link cards via `sampleLink` with presigned URL (1h expiry)
+
+### `[SEND_FILE:path]` Marker Convention
+The agent can include `[SEND_FILE:relative_path]` in its response to send a file to the user.
+- `relative_path` is relative to the user's S3 namespace (e.g., `documents/report.pdf`, `_uploads/file_123.xlsx`)
+- The bridge validates the path (no `..` traversal), verifies the file exists in S3, and sends it
+- Images are sent inline; files/videos are sent as clickable link cards with file size info
+
+### Limitations
+- Files/videos are stored in S3 but not parsed — the agent is told about the file and can use `s3-user-files` tools to access it
+- Bedrock multimodal only supports images (jpeg, png, gif, webp) — video/audio/document content is not sent to the model directly
+- Outbound file delivery uses presigned URLs (1h expiry) via link cards — not native DingTalk file messages
+
 ## Scope Exclusions (v1)
 
 Not in initial implementation:
 - AI Card streaming (plain text replies only)
-- Video/audio/file sending
-- File attachment extraction (.docx, .pdf parsing)
 - Progress notification during long tasks
-- Screenshot delivery ([SCREENSHOT:key] markers)
 - Markdown-to-DingTalk formatting conversion
+- Cron response screenshot/file delivery (cron Lambda lacks S3 access)
+- Native DingTalk file messages via OAPI media upload (currently uses presigned URL link cards)

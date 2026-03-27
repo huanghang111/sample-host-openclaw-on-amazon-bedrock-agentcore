@@ -206,11 +206,17 @@ class DingTalkStack(Stack):
             iam.PolicyStatement(actions=["kms:Decrypt"], resources=[cmk_arn])
         )
 
-        # S3 PutObject for image uploads
+        # S3 PutObject for image/file uploads, GetObject+HeadObject for outbound file delivery
         task_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:PutObject"],
                 resources=[f"{user_files_bucket_arn}/*/_uploads/*"],
+            )
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:HeadObject"],
+                resources=[f"{user_files_bucket_arn}/*"],
             )
         )
 

@@ -30,10 +30,18 @@ fi
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
 export CDK_DEFAULT_REGION="$REGION"
 
-# Agentcore CLI path
-AGENTCORE_CLI="${AGENTCORE_CLI:-agentcore}"
-if ! command -v "$AGENTCORE_CLI" &>/dev/null; then
-  AGENTCORE_CLI="$HOME/.local/bin/agentcore"
+# Agentcore CLI path — check PATH, .venv, ~/.local/bin in order
+AGENTCORE_CLI="${AGENTCORE_CLI:-}"
+if [ -z "$AGENTCORE_CLI" ]; then
+  if command -v agentcore &>/dev/null; then
+    AGENTCORE_CLI="agentcore"
+  elif [ -x "$PROJECT_DIR/.venv/bin/agentcore" ]; then
+    AGENTCORE_CLI="$PROJECT_DIR/.venv/bin/agentcore"
+  elif [ -x "$HOME/.local/bin/agentcore" ]; then
+    AGENTCORE_CLI="$HOME/.local/bin/agentcore"
+  else
+    AGENTCORE_CLI="agentcore"  # fall through — will error at phase 2 with helpful message
+  fi
 fi
 
 echo "=== OpenClaw Hybrid Deploy ==="
@@ -72,6 +80,14 @@ cleanup_orphaned_resources() {
         aws logs delete-log-group --log-group-name "$loggroup" --region "$REGION"
       fi
     done
+  fi
+  if ! aws cloudformation describe-stacks --stack-name OpenClawDingTalk --region "$REGION" &>/dev/null; then
+    local DT_LOG="/openclaw/dingtalk-bridge"
+    if aws logs describe-log-groups --log-group-name-prefix "$DT_LOG" --region "$REGION" \
+       --query "logGroups[?logGroupName=='$DT_LOG'].logGroupName" --output text 2>/dev/null | grep -q .; then
+      echo "  Deleting orphaned log group: $DT_LOG"
+      aws logs delete-log-group --log-group-name "$DT_LOG" --region "$REGION"
+    fi
   fi
 
   # DynamoDB table with explicit name survives stack deletion.
@@ -113,6 +129,109 @@ ensure_bootstrap() {
   fi
 }
 
+# --- Verify S3 user-files bucket exists with correct config ---
+verify_s3_bucket() {
+  local BUCKET="openclaw-user-files-${ACCOUNT}-${REGION}"
+  local CMK_ARN
+  CMK_ARN=$(aws cloudformation describe-stacks --stack-name OpenClawSecurity --region "$REGION" \
+    --query "Stacks[0].Outputs[?contains(OutputKey,'SecretsCmk')].OutputValue" --output text 2>/dev/null || true)
+  local TTL_DAYS
+  TTL_DAYS=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('user_files_ttl_days','365'))" 2>/dev/null || echo "365")
+
+  local CREATED=false
+  if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" &>/dev/null; then
+    echo "  [WARNING] S3 bucket $BUCKET missing — recreating"
+    aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+      --create-bucket-configuration LocationConstraint="$REGION" > /dev/null
+    CREATED=true
+  fi
+
+  # Always verify/repair config — bucket may exist but with wrong settings
+  local NEEDS_FIX=false
+
+  # 1. KMS encryption (CDK: aws:kms with CMK)
+  if [ -n "$CMK_ARN" ]; then
+    local CURRENT_ENC
+    CURRENT_ENC=$(aws s3api get-bucket-encryption --bucket "$BUCKET" --region "$REGION" \
+      --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+      --output text 2>/dev/null || echo "NONE")
+    if [ "$CURRENT_ENC" != "aws:kms" ]; then
+      echo "  Fixing bucket encryption: $CURRENT_ENC → aws:kms"
+      aws s3api put-bucket-encryption --bucket "$BUCKET" --region "$REGION" \
+        --server-side-encryption-configuration \
+        "{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"aws:kms\",\"KMSMasterKeyID\":\"$CMK_ARN\"},\"BucketKeyEnabled\":true}]}"
+      NEEDS_FIX=true
+    fi
+  fi
+
+  # 2. Versioning (CDK: enabled)
+  local CURRENT_VER
+  CURRENT_VER=$(aws s3api get-bucket-versioning --bucket "$BUCKET" --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "NONE")
+  if [ "$CURRENT_VER" != "Enabled" ]; then
+    echo "  Fixing bucket versioning: $CURRENT_VER → Enabled"
+    aws s3api put-bucket-versioning --bucket "$BUCKET" --region "$REGION" \
+      --versioning-configuration Status=Enabled
+    NEEDS_FIX=true
+  fi
+
+  # 3. Block public access (CDK: all blocked)
+  local PUBLIC_BLOCK
+  PUBLIC_BLOCK=$(aws s3api get-public-access-block --bucket "$BUCKET" --region "$REGION" \
+    --query 'PublicAccessBlockConfiguration.BlockPublicAcls' --output text 2>/dev/null || echo "false")
+  if [ "$PUBLIC_BLOCK" != "True" ]; then
+    echo "  Fixing bucket public access block"
+    aws s3api put-public-access-block --bucket "$BUCKET" --region "$REGION" \
+      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+    NEEDS_FIX=true
+  fi
+
+  # 4. Enforce SSL bucket policy (CDK: enforce_ssl=True)
+  local HAS_POLICY
+  HAS_POLICY=$(aws s3api get-bucket-policy --bucket "$BUCKET" --region "$REGION" \
+    --query 'Policy' --output text 2>/dev/null || echo "")
+  if [ -z "$HAS_POLICY" ] || ! echo "$HAS_POLICY" | grep -q "aws:SecureTransport"; then
+    echo "  Fixing bucket SSL enforcement policy"
+    local POLICY
+    POLICY=$(cat <<POLICYEOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "EnforceSSL",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": ["arn:aws:s3:::${BUCKET}", "arn:aws:s3:::${BUCKET}/*"],
+    "Condition": {"Bool": {"aws:SecureTransport": "false"}}
+  }]
+}
+POLICYEOF
+    )
+    aws s3api put-bucket-policy --bucket "$BUCKET" --region "$REGION" --policy "$POLICY"
+    NEEDS_FIX=true
+  fi
+
+  # 5. Lifecycle rule (CDK: expire after TTL_DAYS)
+  local HAS_LIFECYCLE
+  HAS_LIFECYCLE=$(aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" --region "$REGION" \
+    --query 'Rules[0].ID' --output text 2>/dev/null || echo "")
+  if [ -z "$HAS_LIFECYCLE" ] || [ "$HAS_LIFECYCLE" = "None" ]; then
+    echo "  Fixing bucket lifecycle rule (expire after ${TTL_DAYS} days)"
+    aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --region "$REGION" \
+      --lifecycle-configuration \
+      "{\"Rules\":[{\"ID\":\"expire-old-user-files\",\"Status\":\"Enabled\",\"Expiration\":{\"Days\":$TTL_DAYS},\"Filter\":{\"Prefix\":\"\"}}]}"
+    NEEDS_FIX=true
+  fi
+
+  if [ "$CREATED" = true ]; then
+    echo "  Bucket created and configured: $BUCKET"
+  elif [ "$NEEDS_FIX" = true ]; then
+    echo "  Bucket config repaired: $BUCKET"
+  else
+    echo "  Bucket OK: $BUCKET"
+  fi
+}
+
 # --- Phase 1: CDK foundation stacks ---
 phase1_cdk() {
   echo "=== Phase 1: CDK foundation stacks ==="
@@ -128,6 +247,12 @@ phase1_cdk() {
     OpenClawAgentCore \
     OpenClawObservability \
     --require-approval never
+
+  # Verify S3 user-files bucket exists and has correct config.
+  # RETAIN policy means CDK won't recreate if deleted externally, and manual recreation
+  # can leave the bucket without KMS/versioning/policies — causing InvalidToken errors
+  # on presigned URLs and breaking file delivery.
+  verify_s3_bucket
 
   echo "  Phase 1 complete."
   echo ""
@@ -200,6 +325,17 @@ read_cdk_outputs() {
 phase2_toolkit() {
   echo "=== Phase 2: Starter Toolkit deploy ==="
   cd "$PROJECT_DIR"
+  activate_venv
+
+  # Re-resolve agentcore CLI after venv activation (may now be in PATH)
+  if ! command -v "$AGENTCORE_CLI" &>/dev/null; then
+    if command -v agentcore &>/dev/null; then
+      AGENTCORE_CLI="agentcore"
+    else
+      echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-starter-toolkit"
+      exit 1
+    fi
+  fi
 
   read_cdk_outputs
 

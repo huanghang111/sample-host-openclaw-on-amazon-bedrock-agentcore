@@ -56,6 +56,26 @@ CONTENT_TYPE_TO_EXT = {
     "image/gif": "gif", "image/webp": "webp",
 }
 MAX_DINGTALK_TEXT_LEN = 20000
+MAX_FILE_BYTES = 20_000_000  # 20 MB for files/videos
+FILE_EXT_MAP = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+    "video/avi": "avi", "video/x-msvideo": "avi",
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/zip": "zip", "application/x-zip-compressed": "zip",
+    "application/x-rar-compressed": "rar",
+    "text/plain": "txt", "text/csv": "csv",
+    "audio/mpeg": "mp3", "audio/wav": "wav", "audio/ogg": "ogg",
+}
+SCREENSHOT_MARKER_RE = re.compile(r"\[SCREENSHOT:([^\]]+)\]")
+SEND_FILE_MARKER_RE = re.compile(r"\[SEND_FILE:([^\]]+)\]")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".avi"}
 
 # ---------------------------------------------------------------------------
 # AWS clients
@@ -423,30 +443,86 @@ def send_dingtalk_message(receiver_id: str, text: str, *, is_group: bool = False
 # Image handling
 # ---------------------------------------------------------------------------
 
-def _download_dingtalk_image(download_code: str) -> tuple[bytes | None, str]:
-    """Download image from DingTalk using downloadCode. Returns (bytes, content_type)."""
+def _get_dingtalk_download_url(download_code: str) -> str:
+    """Get the actual download URL from DingTalk messageFiles/download API."""
     token = _get_dingtalk_access_token()
     client_id, _ = _get_dingtalk_credentials()
     if not token or not client_id:
-        return None, ""
+        return ""
 
     url = f"{DINGTALK_API}/v1.0/robot/messageFiles/download"
     data = json.dumps({"downloadCode": download_code, "robotCode": client_id}).encode()
+    logger.info("Requesting DingTalk download URL: downloadCode=%s", download_code[:30])
     req = urllib_request.Request(url, data=data, headers={
         "Content-Type": "application/json",
         "x-acs-dingtalk-access-token": token,
     })
     try:
         resp = urllib_request.urlopen(req, timeout=30)
-        content_type = resp.headers.get("Content-Type", "image/jpeg")
-        image_bytes = resp.read(4 * 1024 * 1024)
-        if content_type.split(";")[0].strip() not in ALLOWED_IMAGE_TYPES:
-            logger.warning("DingTalk image type %s not allowed", content_type)
-            return None, ""
-        return image_bytes, content_type.split(";")[0].strip()
+        body = resp.read(1_000_000)
+        result = json.loads(body.decode("utf-8", errors="replace"))
+        download_url = result.get("downloadUrl", "")
+        if not download_url:
+            logger.error("DingTalk download API missing downloadUrl: %s", json.dumps(result, ensure_ascii=False)[:500])
+            return ""
+        # DingTalk OSS URLs may use HTTP — upgrade to HTTPS (OSS supports both)
+        if download_url.startswith("http://"):
+            download_url = "https://" + download_url[7:]
+        logger.info("DingTalk download URL obtained (len=%d)", len(download_url))
+        return download_url
     except Exception as e:
-        logger.error("Failed to download DingTalk image: %s", e)
+        logger.error("Failed to get DingTalk download URL: %s", e)
+        return ""
+
+
+def _download_from_url(download_url: str, max_bytes: int = 4 * 1024 * 1024) -> tuple[bytes | None, str]:
+    """Download file bytes from a URL. Returns (bytes, content_type)."""
+    try:
+        req = urllib_request.Request(download_url)
+        resp = urllib_request.urlopen(req, timeout=60)
+        content_type = resp.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
+        file_bytes = resp.read(max_bytes + 1)
+        if len(file_bytes) > max_bytes:
+            logger.warning("Downloaded file exceeds size limit: %d > %d", len(file_bytes), max_bytes)
+            return None, ""
+        logger.info("Downloaded from URL: %d bytes, type=%s", len(file_bytes), content_type)
+        return file_bytes, content_type
+    except Exception as e:
+        logger.error("Failed to download from URL: %s", e)
         return None, ""
+
+
+def _download_dingtalk_image(download_code: str) -> tuple[bytes | None, str]:
+    """Download image from DingTalk using downloadCode (two-step: get URL, then download).
+    Returns (bytes, content_type)."""
+    download_url = _get_dingtalk_download_url(download_code)
+    if not download_url:
+        return None, ""
+
+    image_bytes, content_type = _download_from_url(download_url, max_bytes=MAX_IMAGE_BYTES)
+    if not image_bytes:
+        return None, ""
+
+    # Infer content type from URL extension if response type is generic
+    if content_type in ("application/octet-stream", "binary/octet-stream", ""):
+        url_lower = download_url.split("?")[0].lower()
+        if url_lower.endswith(".jpg") or url_lower.endswith(".jpeg"):
+            content_type = "image/jpeg"
+        elif url_lower.endswith(".png"):
+            content_type = "image/png"
+        elif url_lower.endswith(".gif"):
+            content_type = "image/gif"
+        elif url_lower.endswith(".webp"):
+            content_type = "image/webp"
+        else:
+            content_type = "image/jpeg"  # safe default for DingTalk images
+
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        logger.warning("DingTalk image type %s not allowed", content_type)
+        return None, ""
+
+    logger.info("DingTalk image ready: %d bytes, type=%s", len(image_bytes), content_type)
+    return image_bytes, content_type
 
 
 def _upload_image_to_s3(image_bytes: bytes, namespace: str, content_type: str) -> str | None:
@@ -464,6 +540,231 @@ def _upload_image_to_s3(image_bytes: bytes, namespace: str, content_type: str) -
     except Exception as e:
         logger.error("S3 image upload failed: %s", e)
         return None
+
+
+def _download_dingtalk_media(download_code: str, max_bytes: int = MAX_FILE_BYTES) -> tuple[bytes | None, str]:
+    """Download any file type from DingTalk using downloadCode (two-step: get URL, then download).
+    Returns (bytes, content_type)."""
+    download_url = _get_dingtalk_download_url(download_code)
+    if not download_url:
+        return None, ""
+    return _download_from_url(download_url, max_bytes=max_bytes)
+
+
+def _upload_file_to_s3(file_bytes: bytes, namespace: str, content_type: str,
+                       prefix: str = "file", ext: str = "") -> str | None:
+    """Upload a file to S3 under the user's namespace. Returns S3 key or None."""
+    if not USER_FILES_BUCKET:
+        return None
+    if not ext:
+        ext = FILE_EXT_MAP.get(content_type, "bin")
+    s3_key = f"{namespace}/_uploads/{prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}.{ext}"
+    try:
+        s3_client.put_object(Bucket=USER_FILES_BUCKET, Key=s3_key, Body=file_bytes, ContentType=content_type)
+        logger.info("Uploaded file to s3://%s/%s (%d bytes)", USER_FILES_BUCKET, s3_key, len(file_bytes))
+        return s3_key
+    except Exception as e:
+        logger.error("S3 file upload failed: %s", e)
+        return None
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+# ---------------------------------------------------------------------------
+# Screenshot delivery helpers
+# ---------------------------------------------------------------------------
+
+def _extract_screenshots(text: str) -> tuple[str, list[str]]:
+    """Extract [SCREENSHOT:key] markers from text. Returns (clean_text, [s3_keys])."""
+    keys = SCREENSHOT_MARKER_RE.findall(text)
+    clean = SCREENSHOT_MARKER_RE.sub("", text).strip()
+    return clean, keys
+
+
+def _fetch_s3_image(s3_key: str, namespace: str) -> bytes | None:
+    """Fetch screenshot image bytes from S3. Returns None on error or invalid key."""
+    if ".." in s3_key:
+        logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
+        return None
+    expected_prefix = f"{namespace}/_screenshots/"
+    if not s3_key.startswith(expected_prefix):
+        logger.error("Rejected S3 screenshot key outside namespace: %s (expected: %s)", s3_key, expected_prefix)
+        return None
+    try:
+        resp = s3_client.get_object(Bucket=USER_FILES_BUCKET, Key=s3_key)
+        return resp["Body"].read()
+    except Exception as e:
+        logger.error("Failed to fetch screenshot from S3: %s — %s", s3_key, e)
+        return None
+
+
+def _send_dingtalk_image(receiver_id: str, image_url: str, *, is_group: bool = False,
+                         conversation_id: str = "") -> None:
+    """Send an image to DingTalk using a URL (presigned S3 URL)."""
+    token = _get_dingtalk_access_token()
+    if not token:
+        return
+    client_id, _ = _get_dingtalk_credentials()
+    headers = {
+        "Content-Type": "application/json",
+        "x-acs-dingtalk-access-token": token,
+    }
+    if is_group:
+        url = f"{DINGTALK_API}/v1.0/robot/groupMessages/send"
+        body = json.dumps({
+            "robotCode": client_id,
+            "openConversationId": conversation_id or receiver_id,
+            "msgKey": "sampleImageMsg",
+            "msgParam": json.dumps({"photoURL": image_url}),
+        }).encode()
+    else:
+        url = f"{DINGTALK_API}/v1.0/robot/oToMessages/batchSend"
+        body = json.dumps({
+            "robotCode": client_id,
+            "userIds": [receiver_id],
+            "msgKey": "sampleImageMsg",
+            "msgParam": json.dumps({"photoURL": image_url}),
+        }).encode()
+    req = urllib_request.Request(url, data=body, headers=headers)
+    try:
+        urllib_request.urlopen(req, timeout=15)
+    except Exception as e:
+        logger.error("Failed to send DingTalk image to %s: %s", receiver_id, e)
+
+
+def _deliver_screenshot(s3_key: str, namespace: str, sender_id: str,
+                        conversation_id: str, is_dm: bool) -> None:
+    """Fetch a screenshot from S3 and send it to DingTalk as an image."""
+    image_bytes = _fetch_s3_image(s3_key, namespace)
+    if not image_bytes:
+        return
+    try:
+        presigned_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": USER_FILES_BUCKET, "Key": s3_key},
+            ExpiresIn=3600,
+        )
+    except Exception as e:
+        logger.error("Failed to generate presigned URL for %s: %s", s3_key, e)
+        return
+    if is_dm:
+        _send_dingtalk_image(sender_id, presigned_url)
+    else:
+        _send_dingtalk_image(conversation_id, presigned_url, is_group=True,
+                             conversation_id=conversation_id)
+
+
+# ---------------------------------------------------------------------------
+# Outbound file delivery helpers
+# ---------------------------------------------------------------------------
+
+def _extract_send_files(text: str) -> tuple[str, list[str]]:
+    """Extract [SEND_FILE:path] markers from text. Returns (clean_text, [relative_paths])."""
+    paths = SEND_FILE_MARKER_RE.findall(text)
+    clean = SEND_FILE_MARKER_RE.sub("", text).strip()
+    return clean, paths
+
+
+def _generate_presigned_url(s3_key: str) -> str | None:
+    """Generate a presigned GET URL for an S3 key (1h expiry)."""
+    try:
+        return s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": USER_FILES_BUCKET, "Key": s3_key},
+            ExpiresIn=3600,
+        )
+    except Exception as e:
+        logger.error("Failed to generate presigned URL for %s: %s", s3_key, e)
+        return None
+
+
+def _send_dingtalk_link(receiver_id: str, title: str, text: str, message_url: str,
+                        *, is_group: bool = False, conversation_id: str = "") -> None:
+    """Send a link card to DingTalk (for file/video downloads)."""
+    token = _get_dingtalk_access_token()
+    if not token:
+        return
+    client_id, _ = _get_dingtalk_credentials()
+    headers = {
+        "Content-Type": "application/json",
+        "x-acs-dingtalk-access-token": token,
+    }
+    msg_param = json.dumps({"title": title, "text": text, "messageUrl": message_url, "picUrl": ""})
+    if is_group:
+        url = f"{DINGTALK_API}/v1.0/robot/groupMessages/send"
+        body = json.dumps({
+            "robotCode": client_id,
+            "openConversationId": conversation_id or receiver_id,
+            "msgKey": "sampleLink",
+            "msgParam": msg_param,
+        }).encode()
+    else:
+        url = f"{DINGTALK_API}/v1.0/robot/oToMessages/batchSend"
+        body = json.dumps({
+            "robotCode": client_id,
+            "userIds": [receiver_id],
+            "msgKey": "sampleLink",
+            "msgParam": msg_param,
+        }).encode()
+    req = urllib_request.Request(url, data=body, headers=headers)
+    try:
+        urllib_request.urlopen(req, timeout=15)
+    except Exception as e:
+        logger.error("Failed to send DingTalk link to %s: %s", receiver_id, e)
+
+
+def _deliver_file(relative_path: str, namespace: str, sender_id: str,
+                  conversation_id: str, is_dm: bool) -> None:
+    """Deliver a user file from S3 to DingTalk. Images sent inline, others as link cards."""
+    if ".." in relative_path:
+        logger.error("Rejected SEND_FILE with path traversal: %s", relative_path)
+        return
+
+    s3_key = f"{namespace}/{relative_path}"
+
+    # Verify the file exists
+    try:
+        head = s3_client.head_object(Bucket=USER_FILES_BUCKET, Key=s3_key)
+        file_size = head.get("ContentLength", 0)
+    except Exception as e:
+        logger.error("SEND_FILE target not found in S3: %s — %s", s3_key, e)
+        return
+
+    presigned_url = _generate_presigned_url(s3_key)
+    if not presigned_url:
+        return
+
+    # Determine file type from extension
+    filename = relative_path.rsplit("/", 1)[-1] if "/" in relative_path else relative_path
+    ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
+
+    if ext in IMAGE_EXTENSIONS:
+        # Send as inline image
+        if is_dm:
+            _send_dingtalk_image(sender_id, presigned_url)
+        else:
+            _send_dingtalk_image(conversation_id, presigned_url,
+                                 is_group=True, conversation_id=conversation_id)
+    else:
+        # Send as link card (files, videos, etc.)
+        size_str = _format_size(file_size)
+        if ext in VIDEO_EXTENSIONS:
+            desc = f"Video · {size_str} · Click to download"
+        else:
+            desc = f"File · {size_str} · Click to download"
+        if is_dm:
+            _send_dingtalk_link(sender_id, filename, desc, presigned_url)
+        else:
+            _send_dingtalk_link(conversation_id, filename, desc, presigned_url,
+                                is_group=True, conversation_id=conversation_id)
+
+    logger.info("Delivered file to DingTalk: %s (%s)", filename, ext or "no ext")
 
 
 # ---------------------------------------------------------------------------
@@ -546,16 +847,46 @@ def _process_message_inner(data: dict) -> None:
     download_code = ""
     if msg_type == "picture":
         content = data.get("content", {})
+        logger.info("Picture message raw content type=%s value=%s", type(content).__name__, str(content)[:300])
         if isinstance(content, str):
             try:
                 content = json.loads(content)
             except json.JSONDecodeError:
                 content = {}
         download_code = content.get("downloadCode", "") or content.get("pictureDownloadCode", "")
+        logger.info("Picture downloadCode=%s (len=%d)", download_code[:30] if download_code else "(empty)", len(download_code))
+
+    # Extract file info
+    file_download_code = ""
+    file_name = ""
+    if msg_type == "file":
+        content = data.get("content", {})
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError:
+                content = {}
+        file_download_code = content.get("downloadCode", "")
+        file_name = content.get("fileName", "unknown_file")
+
+    # Extract video info
+    video_download_code = ""
+    video_duration = ""
+    if msg_type == "video":
+        content = data.get("content", {})
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError:
+                content = {}
+        video_download_code = content.get("downloadCode", "")
+        video_duration = content.get("duration", "")
 
     has_image = bool(download_code)
+    has_file = bool(file_download_code)
+    has_video = bool(video_download_code)
 
-    if not text and not has_image:
+    if not text and not has_image and not has_file and not has_video:
         logger.info("Ignoring empty message from %s", sender_id)
         return
 
@@ -610,8 +941,8 @@ def _process_message_inner(data: dict) -> None:
 
     # Build message payload
     agent_message = text
+    namespace = actor_id.replace(":", "_")
     if has_image:
-        namespace = actor_id.replace(":", "_")
         image_bytes, content_type = _download_dingtalk_image(download_code)
         if image_bytes:
             s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
@@ -625,6 +956,51 @@ def _process_message_inner(data: dict) -> None:
                 return
         else:
             _send_reply(sender_id, conversation_id, is_dm, "Sorry, I couldn't download that image.")
+            return
+    elif has_file:
+        file_bytes, content_type = _download_dingtalk_media(file_download_code)
+        if file_bytes:
+            ext = FILE_EXT_MAP.get(content_type, "")
+            if not ext and "." in file_name:
+                ext = file_name.rsplit(".", 1)[-1].lower()
+            s3_key = _upload_file_to_s3(file_bytes, namespace, content_type, prefix="file", ext=ext or "bin")
+            if s3_key:
+                size_str = _format_size(len(file_bytes))
+                relative_path = s3_key.split("/", 1)[1] if "/" in s3_key else s3_key
+                agent_message = (
+                    (f"{text}\n\n" if text else "")
+                    + f"[User uploaded a file: {file_name} ({content_type}, {size_str})]\n"
+                      f"[File saved to: {relative_path}]\n"
+                      f"[Use the file management tools to read or process this file.]"
+                )
+            else:
+                _send_reply(sender_id, conversation_id, is_dm, "Sorry, I couldn't save that file. Please try again.")
+                return
+        else:
+            _send_reply(sender_id, conversation_id, is_dm, "Sorry, I couldn't download that file from DingTalk.")
+            return
+    elif has_video:
+        video_bytes, content_type = _download_dingtalk_media(video_download_code)
+        if video_bytes:
+            ext = content_type.split("/")[-1] if "/" in content_type else "mp4"
+            if ext not in ("mp4", "mov", "webm", "avi"):
+                ext = "mp4"
+            s3_key = _upload_file_to_s3(video_bytes, namespace, content_type, prefix="vid", ext=ext)
+            if s3_key:
+                size_str = _format_size(len(video_bytes))
+                relative_path = s3_key.split("/", 1)[1] if "/" in s3_key else s3_key
+                duration_info = f", {video_duration}s" if video_duration else ""
+                agent_message = (
+                    (f"{text}\n\n" if text else "")
+                    + f"[User uploaded a video ({content_type}, {size_str}{duration_info})]\n"
+                      f"[Video saved to: {relative_path}]\n"
+                      f"[Use the file management tools to access this video.]"
+                )
+            else:
+                _send_reply(sender_id, conversation_id, is_dm, "Sorry, I couldn't save that video. Please try again.")
+                return
+        else:
+            _send_reply(sender_id, conversation_id, is_dm, "Sorry, I couldn't download that video from DingTalk.")
             return
 
     # Get or create session
@@ -642,10 +1018,26 @@ def _process_message_inner(data: dict) -> None:
     response_text = _extract_text_from_content_blocks(response_text)
     if not response_text or not response_text.strip():
         response_text = "Sorry, I received an empty response. Please try again."
+
+    # Deliver screenshots as images before sending text
+    clean_text, screenshot_keys = _extract_screenshots(response_text)
+    if screenshot_keys:
+        for key in screenshot_keys:
+            _deliver_screenshot(key, namespace, sender_id, conversation_id, is_dm)
+        response_text = clean_text
+
+    # Deliver outbound files (images inline, files/videos as link cards)
+    clean_text, file_paths = _extract_send_files(response_text)
+    if file_paths:
+        for path in file_paths:
+            _deliver_file(path, namespace, sender_id, conversation_id, is_dm)
+        response_text = clean_text
+
     logger.info("Response len=%d first200=%s", len(response_text), response_text[:200])
 
     # Send reply
-    _send_reply(sender_id, conversation_id, is_dm, response_text)
+    if response_text.strip():
+        _send_reply(sender_id, conversation_id, is_dm, response_text)
     logger.info("Reply sent to %s (dm=%s)", sender_id, is_dm)
 
 
