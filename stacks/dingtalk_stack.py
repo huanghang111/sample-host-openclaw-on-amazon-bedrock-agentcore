@@ -245,6 +245,8 @@ class DingTalkStack(Stack):
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                         f"Resource::{user_files_bucket_arn}/*/_uploads/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
+                        f"Resource::{user_files_bucket_arn}/*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
                         "Action::kms:GenerateDataKey*",
                         "Resource::*",
                     ],
