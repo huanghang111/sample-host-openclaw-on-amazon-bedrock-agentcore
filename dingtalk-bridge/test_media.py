@@ -364,6 +364,68 @@ class TestExtractSendFiles(unittest.TestCase):
         self.assertEqual(paths, ["_uploads/file_123_abc.xlsx"])
 
 
+class TestConvertS3UrlsToMarkers(unittest.TestCase):
+    NS = "dingtalk_01455368144039922107"
+    BUCKET = "openclaw-user-files-585306731051-us-west-2"
+
+    def test_no_urls(self):
+        text = "Hello world, no URLs here"
+        self.assertEqual(bridge._convert_s3_urls_to_markers(text, self.NS), text)
+
+    def test_markdown_link_with_presigned_url(self):
+        text = (
+            f"Here is the file 👉 [点击查看](https://{self.BUCKET}.s3.us-west-2.amazonaws.com"
+            f"/{self.NS}/_uploads_cute_dog.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=foo)"
+        )
+        result = bridge._convert_s3_urls_to_markers(text, self.NS)
+        self.assertIn("[SEND_FILE:_uploads_cute_dog.jpg]", result)
+        self.assertNotIn("amazonaws.com", result)
+
+    def test_bare_presigned_url(self):
+        text = (
+            f"Download: https://{self.BUCKET}.s3.us-west-2.amazonaws.com"
+            f"/{self.NS}/documents/report.pdf?X-Amz-Algorithm=AWS4"
+        )
+        result = bridge._convert_s3_urls_to_markers(text, self.NS)
+        self.assertIn("[SEND_FILE:documents/report.pdf]", result)
+
+    def test_plain_s3_url_no_query(self):
+        text = (
+            f"https://{self.BUCKET}.s3.us-west-2.amazonaws.com"
+            f"/{self.NS}/data/export.xlsx"
+        )
+        result = bridge._convert_s3_urls_to_markers(text, self.NS)
+        self.assertIn("[SEND_FILE:data/export.xlsx]", result)
+
+    def test_wrong_namespace_not_converted(self):
+        text = (
+            f"https://{self.BUCKET}.s3.us-west-2.amazonaws.com"
+            f"/other_user/secret.pdf"
+        )
+        result = bridge._convert_s3_urls_to_markers(text, self.NS)
+        self.assertEqual(result, text)  # unchanged
+
+    def test_multiple_urls(self):
+        text = (
+            f"File 1: https://{self.BUCKET}.s3.us-west-2.amazonaws.com/{self.NS}/a.pdf "
+            f"File 2: https://{self.BUCKET}.s3.us-west-2.amazonaws.com/{self.NS}/b.png"
+        )
+        result = bridge._convert_s3_urls_to_markers(text, self.NS)
+        self.assertIn("[SEND_FILE:a.pdf]", result)
+        self.assertIn("[SEND_FILE:b.png]", result)
+
+    def test_preserves_surrounding_text(self):
+        text = (
+            f"Here is the image "
+            f"https://{self.BUCKET}.s3.us-west-2.amazonaws.com/{self.NS}/img.jpg"
+            f" enjoy!"
+        )
+        result = bridge._convert_s3_urls_to_markers(text, self.NS)
+        self.assertIn("Here is the image", result)
+        self.assertIn("[SEND_FILE:img.jpg]", result)
+        self.assertIn("enjoy!", result)
+
+
 class TestSendDingtalkLink(unittest.TestCase):
     @patch.object(bridge, "_get_dingtalk_credentials", return_value=("clientId", "secret"))
     @patch.object(bridge, "_get_dingtalk_access_token", return_value="token123")
@@ -390,47 +452,181 @@ class TestSendDingtalkLink(unittest.TestCase):
         self.assertEqual(body["openConversationId"], "conv123")
 
 
+class TestUploadMediaToDingtalk(unittest.TestCase):
+    @patch.object(bridge, "_get_dingtalk_access_token", return_value="token123")
+    @patch("bridge.urllib_request.urlopen")
+    def test_uploads_file(self, mock_urlopen, mock_token):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "errcode": 0, "media_id": "@media_abc123", "type": "file"
+        }).encode()
+        mock_urlopen.return_value = mock_resp
+
+        result = bridge._upload_media_to_dingtalk(b"pdf-content", "report.pdf", "file")
+        self.assertEqual(result, "@media_abc123")
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        self.assertIn("media/upload", req.full_url)
+        self.assertIn("type=file", req.full_url)
+        self.assertIn("multipart/form-data", req.headers["Content-type"])
+
+    @patch.object(bridge, "_get_dingtalk_access_token", return_value="token123")
+    @patch("bridge.urllib_request.urlopen")
+    def test_upload_error(self, mock_urlopen, mock_token):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "errcode": 400001, "errmsg": "bad request"
+        }).encode()
+        mock_urlopen.return_value = mock_resp
+
+        result = bridge._upload_media_to_dingtalk(b"data", "bad.pdf", "file")
+        self.assertIsNone(result)
+
+    @patch.object(bridge, "_get_dingtalk_access_token", return_value="")
+    def test_no_token(self, mock_token):
+        result = bridge._upload_media_to_dingtalk(b"data", "test.pdf", "file")
+        self.assertIsNone(result)
+
+    @patch.object(bridge, "_get_dingtalk_access_token", return_value="token123")
+    @patch("bridge.urllib_request.urlopen", side_effect=Exception("network error"))
+    def test_network_error(self, mock_urlopen, mock_token):
+        result = bridge._upload_media_to_dingtalk(b"data", "test.pdf", "file")
+        self.assertIsNone(result)
+
+
+class TestSendDingtalkFileNative(unittest.TestCase):
+    @patch.object(bridge, "_get_dingtalk_credentials", return_value=("clientId", "secret"))
+    @patch.object(bridge, "_get_dingtalk_access_token", return_value="token123")
+    @patch("bridge.urllib_request.urlopen")
+    def test_sends_dm_file(self, mock_urlopen, mock_token, mock_creds):
+        bridge._send_dingtalk_file_native("user123", "@media_abc", "report.pdf", "pdf")
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data)
+        self.assertEqual(body["msgKey"], "sampleFile")
+        self.assertEqual(body["userIds"], ["user123"])
+        params = json.loads(body["msgParam"])
+        self.assertEqual(params["mediaId"], "@media_abc")
+        self.assertEqual(params["fileName"], "report.pdf")
+        self.assertEqual(params["fileType"], "pdf")
+
+    @patch.object(bridge, "_get_dingtalk_credentials", return_value=("clientId", "secret"))
+    @patch.object(bridge, "_get_dingtalk_access_token", return_value="token123")
+    @patch("bridge.urllib_request.urlopen")
+    def test_sends_group_file(self, mock_urlopen, mock_token, mock_creds):
+        bridge._send_dingtalk_file_native("conv123", "@media_abc", "data.xlsx", "xlsx",
+                                           is_group=True, conversation_id="conv123")
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data)
+        self.assertEqual(body["msgKey"], "sampleFile")
+        self.assertEqual(body["openConversationId"], "conv123")
+        self.assertIn("groupMessages", req.full_url)
+
+
 class TestDeliverFile(unittest.TestCase):
     def test_rejects_path_traversal(self):
         bridge._deliver_file("../other/secret.txt", "ns", "u1", "c1", True)
         # Should log error and return without sending
 
     @patch.object(bridge, "_send_dingtalk_image")
+    @patch.object(bridge, "_upload_media_to_dingtalk", return_value="@img_media_id")
     @patch.object(bridge, "s3_client")
     @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
-    def test_delivers_image_inline(self, mock_s3, mock_send_img):
+    def test_delivers_image_natively(self, mock_s3, mock_upload, mock_send_img):
         mock_s3.head_object.return_value = {"ContentLength": 50000}
-        mock_s3.generate_presigned_url.return_value = "https://presigned/img.jpg"
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"img-bytes"
+        mock_s3.get_object.return_value = {"Body": mock_body}
 
         bridge._deliver_file("_uploads/img_123.jpg", "ns", "user1", "cid1", True)
-        mock_send_img.assert_called_once_with("user1", "https://presigned/img.jpg")
+        mock_upload.assert_called_once_with(b"img-bytes", "img_123.jpg", media_type="image")
+        mock_send_img.assert_called_once_with("user1", "@img_media_id")
 
-    @patch.object(bridge, "_send_dingtalk_link")
+    @patch.object(bridge, "_send_dingtalk_file_native")
+    @patch.object(bridge, "_upload_media_to_dingtalk", return_value="@media_abc")
     @patch.object(bridge, "s3_client")
     @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
-    def test_delivers_file_as_link(self, mock_s3, mock_send_link):
+    def test_delivers_file_natively(self, mock_s3, mock_upload, mock_send_file):
         mock_s3.head_object.return_value = {"ContentLength": 1_200_000}
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"pdf-bytes"
+        mock_s3.get_object.return_value = {"Body": mock_body}
+
+        bridge._deliver_file("documents/report.pdf", "ns", "user1", "cid1", True)
+        mock_upload.assert_called_once_with(b"pdf-bytes", "report.pdf", media_type="file")
+        mock_send_file.assert_called_once_with("user1", "@media_abc", "report.pdf", "pdf")
+
+    @patch.object(bridge, "_send_dingtalk_file_native")
+    @patch.object(bridge, "_upload_media_to_dingtalk", return_value="@media_xyz")
+    @patch.object(bridge, "s3_client")
+    @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
+    def test_delivers_file_natively_group(self, mock_s3, mock_upload, mock_send_file):
+        mock_s3.head_object.return_value = {"ContentLength": 500_000}
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"xlsx-bytes"
+        mock_s3.get_object.return_value = {"Body": mock_body}
+
+        bridge._deliver_file("data.xlsx", "ns", "user1", "conv1", False)
+        mock_send_file.assert_called_once_with(
+            "conv1", "@media_xyz", "data.xlsx", "xlsx",
+            is_group=True, conversation_id="conv1")
+
+    @patch.object(bridge, "_send_dingtalk_link")
+    @patch.object(bridge, "_upload_media_to_dingtalk", return_value=None)
+    @patch.object(bridge, "s3_client")
+    @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
+    def test_falls_back_to_link_on_upload_failure(self, mock_s3, mock_upload, mock_send_link):
+        mock_s3.head_object.return_value = {"ContentLength": 1_200_000}
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"pdf-bytes"
+        mock_s3.get_object.return_value = {"Body": mock_body}
         mock_s3.generate_presigned_url.return_value = "https://presigned/report.pdf"
 
         bridge._deliver_file("documents/report.pdf", "ns", "user1", "cid1", True)
         mock_send_link.assert_called_once()
         args = mock_send_link.call_args[0]
-        self.assertEqual(args[0], "user1")
         self.assertEqual(args[1], "report.pdf")
         self.assertIn("1.1 MB", args[2])
-        self.assertEqual(args[3], "https://presigned/report.pdf")
+
+    @patch.object(bridge, "_send_dingtalk_link")
+    @patch.object(bridge, "s3_client")
+    @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
+    def test_large_file_skips_native_uses_link(self, mock_s3, mock_send_link):
+        """Files >10MB skip native upload and go straight to presigned URL link card."""
+        mock_s3.head_object.return_value = {"ContentLength": 15_000_000}
+        mock_s3.generate_presigned_url.return_value = "https://presigned/big.zip"
+
+        bridge._deliver_file("archives/big.zip", "ns", "user1", "cid1", True)
+        mock_send_link.assert_called_once()
+        # Should NOT attempt S3 get_object for native upload
+        mock_s3.get_object.assert_not_called()
 
     @patch.object(bridge, "_send_dingtalk_link")
     @patch.object(bridge, "s3_client")
     @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
     def test_delivers_video_as_link(self, mock_s3, mock_send_link):
-        mock_s3.head_object.return_value = {"ContentLength": 5_000_000}
+        """Videos >10MB fall back to link card with Video description."""
+        mock_s3.head_object.return_value = {"ContentLength": 15_000_000}
         mock_s3.generate_presigned_url.return_value = "https://presigned/clip.mp4"
 
         bridge._deliver_file("_uploads/vid_123.mp4", "ns", "user1", "cid1", True)
         mock_send_link.assert_called_once()
         args = mock_send_link.call_args[0]
         self.assertIn("Video", args[2])
+
+    @patch.object(bridge, "_send_dingtalk_file_native")
+    @patch.object(bridge, "_upload_media_to_dingtalk", return_value="@media_vid")
+    @patch.object(bridge, "s3_client")
+    @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")
+    def test_delivers_small_video_natively(self, mock_s3, mock_upload, mock_send_file):
+        """Videos ≤10MB use native file sending."""
+        mock_s3.head_object.return_value = {"ContentLength": 5_000_000}
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"video-bytes"
+        mock_s3.get_object.return_value = {"Body": mock_body}
+
+        bridge._deliver_file("_uploads/vid_123.mp4", "ns", "user1", "cid1", True)
+        mock_send_file.assert_called_once_with("user1", "@media_vid", "vid_123.mp4", "mp4")
 
     @patch.object(bridge, "s3_client")
     @patch.object(bridge, "USER_FILES_BUCKET", "test-bucket")

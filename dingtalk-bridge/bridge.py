@@ -48,6 +48,8 @@ AGENTCORE_READ_TIMEOUT = 580  # seconds — generous for long subagent tasks
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 
 DINGTALK_API = "https://api.dingtalk.com"
+DINGTALK_OAPI = "https://oapi.dingtalk.com"
+DINGTALK_MEDIA_MAX_BYTES = 10_000_000  # 10 MB — DingTalk OAPI media upload limit
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_IMAGE_BYTES = 3_750_000
@@ -74,7 +76,15 @@ FILE_EXT_MAP = {
 }
 SCREENSHOT_MARKER_RE = re.compile(r"\[SCREENSHOT:([^\]]+)\]")
 SEND_FILE_MARKER_RE = re.compile(r"\[SEND_FILE:([^\]]+)\]")
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+# Matches S3 URLs (presigned or plain) that the model may generate despite instructions
+# Captures the S3 key from the URL path, handles both path-style and virtual-hosted-style
+S3_URL_RE = re.compile(
+    r"https?://(?:openclaw-user-files[^/]*\.s3[^/]*\.amazonaws\.com|s3[^/]*\.amazonaws\.com/openclaw-user-files[^/]*)"
+    r"/([^\s?\")]+)"
+)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+# Note: .gif excluded — DingTalk sampleImageMsg doesn't render GIF animations.
+# GIFs are sent as native files via sampleFile instead.
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".avi"}
 
 # ---------------------------------------------------------------------------
@@ -638,20 +648,113 @@ def _send_dingtalk_image(receiver_id: str, image_url: str, *, is_group: bool = F
         logger.error("Failed to send DingTalk image to %s: %s", receiver_id, e)
 
 
+def _upload_media_to_dingtalk(file_bytes: bytes, filename: str,
+                              media_type: str = "file") -> str | None:
+    """Upload file to DingTalk media storage via OAPI. Returns media_id or None.
+
+    media_type: 'image' (≤1MB), 'voice' (≤2MB), 'video' (≤10MB), 'file' (≤10MB)
+    """
+    token = _get_dingtalk_access_token()
+    if not token:
+        return None
+
+    boundary = f"----DingTalkMedia{uuid.uuid4().hex[:16]}"
+    # Build multipart/form-data body
+    parts = []
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(f'Content-Disposition: form-data; name="media"; filename="{filename}"\r\n'.encode())
+    parts.append(b"Content-Type: application/octet-stream\r\n\r\n")
+    parts.append(file_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    url = f"{DINGTALK_OAPI}/media/upload?access_token={token}&type={media_type}"
+    req = urllib_request.Request(url, data=body, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    })
+    try:
+        resp = urllib_request.urlopen(req, timeout=60)
+        result = json.loads(resp.read())
+        if result.get("errcode", 0) != 0:
+            logger.error("DingTalk media upload error: errcode=%s errmsg=%s",
+                         result.get("errcode"), result.get("errmsg"))
+            return None
+        media_id = result.get("media_id", "")
+        if media_id:
+            logger.info("Uploaded media to DingTalk: media_id=%s type=%s size=%d",
+                         media_id[:30], media_type, len(file_bytes))
+            return media_id
+        logger.error("DingTalk media upload missing media_id: %s", result)
+    except Exception as e:
+        logger.error("DingTalk media upload failed: %s", e)
+    return None
+
+
+def _send_dingtalk_file_native(receiver_id: str, media_id: str, filename: str,
+                                file_type: str, *, is_group: bool = False,
+                                conversation_id: str = "") -> None:
+    """Send a file via DingTalk native sampleFile message."""
+    token = _get_dingtalk_access_token()
+    if not token:
+        return
+    client_id, _ = _get_dingtalk_credentials()
+    headers = {
+        "Content-Type": "application/json",
+        "x-acs-dingtalk-access-token": token,
+    }
+    msg_param = json.dumps({"mediaId": media_id, "fileName": filename, "fileType": file_type})
+    if is_group:
+        url = f"{DINGTALK_API}/v1.0/robot/groupMessages/send"
+        body = json.dumps({
+            "robotCode": client_id,
+            "openConversationId": conversation_id or receiver_id,
+            "msgKey": "sampleFile",
+            "msgParam": msg_param,
+        }).encode()
+    else:
+        url = f"{DINGTALK_API}/v1.0/robot/oToMessages/batchSend"
+        body = json.dumps({
+            "robotCode": client_id,
+            "userIds": [receiver_id],
+            "msgKey": "sampleFile",
+            "msgParam": msg_param,
+        }).encode()
+    req = urllib_request.Request(url, data=body, headers=headers)
+    try:
+        urllib_request.urlopen(req, timeout=15)
+    except Exception as e:
+        logger.error("Failed to send DingTalk native file to %s: %s", receiver_id, e)
+
+
 def _deliver_screenshot(s3_key: str, namespace: str, sender_id: str,
                         conversation_id: str, is_dm: bool) -> None:
-    """Fetch a screenshot from S3 and send it to DingTalk as an image."""
+    """Fetch a screenshot from S3 and send it to DingTalk via native media upload."""
     image_bytes = _fetch_s3_image(s3_key, namespace)
     if not image_bytes:
         return
-    try:
-        presigned_url = s3_client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": USER_FILES_BUCKET, "Key": s3_key},
-            ExpiresIn=3600,
-        )
-    except Exception as e:
-        logger.error("Failed to generate presigned URL for %s: %s", s3_key, e)
+    # Try native image upload (≤1MB for image type)
+    if len(image_bytes) <= 1_000_000:
+        media_id = _upload_media_to_dingtalk(image_bytes, "screenshot.png", media_type="image")
+        if media_id:
+            if is_dm:
+                _send_dingtalk_image(sender_id, media_id)
+            else:
+                _send_dingtalk_image(conversation_id, media_id, is_group=True,
+                                     conversation_id=conversation_id)
+            return
+    # Fallback: send as native file
+    media_id = _upload_media_to_dingtalk(image_bytes, "screenshot.png", media_type="file")
+    if media_id:
+        if is_dm:
+            _send_dingtalk_file_native(sender_id, media_id, "screenshot.png", "png")
+        else:
+            _send_dingtalk_file_native(conversation_id, media_id, "screenshot.png", "png",
+                                       is_group=True, conversation_id=conversation_id)
+        return
+    # Last resort: presigned URL
+    logger.warning("Native screenshot upload failed, falling back to presigned URL")
+    presigned_url = _generate_presigned_url(s3_key)
+    if not presigned_url:
         return
     if is_dm:
         _send_dingtalk_image(sender_id, presigned_url)
@@ -663,6 +766,42 @@ def _deliver_screenshot(s3_key: str, namespace: str, sender_id: str,
 # ---------------------------------------------------------------------------
 # Outbound file delivery helpers
 # ---------------------------------------------------------------------------
+
+def _convert_s3_urls_to_markers(text: str, namespace: str) -> str:
+    """Convert S3 URLs in text to [SEND_FILE:path] markers.
+
+    The model sometimes generates presigned S3 URLs despite instructions to use
+    [SEND_FILE:path]. This function intercepts those URLs and converts them so
+    the bridge can deliver files natively.
+    """
+    prefix = f"{namespace}/"
+
+    def _replace(match):
+        s3_key = match.group(1)
+        # URL-decode the key (handles %20, etc.)
+        s3_key = s3_key.replace("%2F", "/").replace("%20", " ")
+        # Only convert if the key belongs to this user's namespace
+        if not s3_key.startswith(prefix):
+            return match.group(0)  # leave as-is
+        relative_path = s3_key[len(prefix):]
+        if not relative_path:
+            return match.group(0)
+        logger.info("Converted S3 URL to SEND_FILE marker: %s", relative_path)
+        return f"[SEND_FILE:{relative_path}]"
+
+    # Replace S3 URLs (including any surrounding markdown link syntax)
+    # Pattern: [text](S3_URL) or bare S3_URL
+    result = re.sub(
+        r"\[[^\]]*\]\(\s*" + S3_URL_RE.pattern + r"[^\)]*\)",
+        lambda m: f"[SEND_FILE:{m.group(1)[len(prefix):]!s}]"
+        if m.group(1).startswith(prefix) and m.group(1)[len(prefix):]
+        else m.group(0),
+        text,
+    )
+    # Also handle bare URLs not in markdown links
+    result = S3_URL_RE.sub(_replace, result)
+    return result
+
 
 def _extract_send_files(text: str) -> tuple[str, list[str]]:
     """Extract [SEND_FILE:path] markers from text. Returns (clean_text, [relative_paths])."""
@@ -721,7 +860,12 @@ def _send_dingtalk_link(receiver_id: str, title: str, text: str, message_url: st
 
 def _deliver_file(relative_path: str, namespace: str, sender_id: str,
                   conversation_id: str, is_dm: bool) -> None:
-    """Deliver a user file from S3 to DingTalk. Images sent inline, others as link cards."""
+    """Deliver a user file from S3 to DingTalk via native media upload.
+
+    All files ≤10MB: upload to DingTalk media storage, send via sampleFile.
+    Images ≤1MB: upload as type=image, send via sampleImageMsg (inline preview).
+    Files >10MB or upload failure: fallback to presigned URL link card.
+    """
     if ".." in relative_path:
         logger.error("Rejected SEND_FILE with path traversal: %s", relative_path)
         return
@@ -736,35 +880,65 @@ def _deliver_file(relative_path: str, namespace: str, sender_id: str,
         logger.error("SEND_FILE target not found in S3: %s — %s", s3_key, e)
         return
 
-    presigned_url = _generate_presigned_url(s3_key)
-    if not presigned_url:
-        return
-
     # Determine file type from extension
     filename = relative_path.rsplit("/", 1)[-1] if "/" in relative_path else relative_path
     ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
 
-    if ext in IMAGE_EXTENSIONS:
-        # Send as inline image
-        if is_dm:
-            _send_dingtalk_image(sender_id, presigned_url)
-        else:
-            _send_dingtalk_image(conversation_id, presigned_url,
-                                 is_group=True, conversation_id=conversation_id)
-    else:
-        # Send as link card (files, videos, etc.)
-        size_str = _format_size(file_size)
-        if ext in VIDEO_EXTENSIONS:
-            desc = f"Video · {size_str} · Click to download"
-        else:
-            desc = f"File · {size_str} · Click to download"
-        if is_dm:
-            _send_dingtalk_link(sender_id, filename, desc, presigned_url)
-        else:
-            _send_dingtalk_link(conversation_id, filename, desc, presigned_url,
-                                is_group=True, conversation_id=conversation_id)
+    # Try native DingTalk media upload for all files ≤10MB
+    if file_size <= DINGTALK_MEDIA_MAX_BYTES:
+        try:
+            resp = s3_client.get_object(Bucket=USER_FILES_BUCKET, Key=s3_key)
+            file_bytes = resp["Body"].read()
+        except Exception as e:
+            logger.error("Failed to download from S3 for native send: %s — %s", s3_key, e)
+            file_bytes = None
 
-    logger.info("Delivered file to DingTalk: %s (%s)", filename, ext or "no ext")
+        if file_bytes:
+            # Images ≤1MB: upload as image type for inline preview via sampleImageMsg
+            is_image = ext in IMAGE_EXTENSIONS
+            if is_image and len(file_bytes) <= 1_000_000:
+                media_id = _upload_media_to_dingtalk(file_bytes, filename, media_type="image")
+                if media_id:
+                    # DingTalk resolves media_id internally when used as photoURL
+                    if is_dm:
+                        _send_dingtalk_image(sender_id, media_id)
+                    else:
+                        _send_dingtalk_image(conversation_id, media_id,
+                                             is_group=True, conversation_id=conversation_id)
+                    logger.info("Delivered image natively to DingTalk: %s (%s)",
+                                 filename, _format_size(file_size))
+                    return
+
+            # All other files (or image upload failed): send as native file
+            file_type = ext.lstrip(".") if ext else "file"
+            media_id = _upload_media_to_dingtalk(file_bytes, filename, media_type="file")
+            if media_id:
+                if is_dm:
+                    _send_dingtalk_file_native(sender_id, media_id, filename, file_type)
+                else:
+                    _send_dingtalk_file_native(conversation_id, media_id, filename, file_type,
+                                               is_group=True, conversation_id=conversation_id)
+                logger.info("Delivered file natively to DingTalk: %s (%s, %s)",
+                             filename, ext, _format_size(file_size))
+                return
+        logger.warning("Native upload failed for %s, falling back to presigned URL", filename)
+
+    # Fallback: presigned URL link card (files >10MB or native upload failure)
+    presigned_url = _generate_presigned_url(s3_key)
+    if not presigned_url:
+        return
+    size_str = _format_size(file_size)
+    if ext in VIDEO_EXTENSIONS:
+        desc = f"Video · {size_str} · Click to download"
+    else:
+        desc = f"File · {size_str} · Click to download"
+    if is_dm:
+        _send_dingtalk_link(sender_id, filename, desc, presigned_url)
+    else:
+        _send_dingtalk_link(conversation_id, filename, desc, presigned_url,
+                            is_group=True, conversation_id=conversation_id)
+    logger.info("Delivered file via link card to DingTalk: %s (%s, %s)",
+                 filename, ext, _format_size(file_size))
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1200,10 @@ def _process_message_inner(data: dict) -> None:
             _deliver_screenshot(key, namespace, sender_id, conversation_id, is_dm)
         response_text = clean_text
 
-    # Deliver outbound files (images inline, files/videos as link cards)
+    # Convert any S3 URLs to [SEND_FILE:path] markers (model sometimes ignores instructions)
+    response_text = _convert_s3_urls_to_markers(response_text, namespace)
+
+    # Deliver outbound files (images inline, files/videos as native file messages)
     clean_text, file_paths = _extract_send_files(response_text)
     if file_paths:
         for path in file_paths:

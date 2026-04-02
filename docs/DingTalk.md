@@ -52,12 +52,13 @@ This is fundamentally different from Telegram/Slack/Feishu which use inbound HTT
 
 ## DingTalk APIs Used
 
-| Purpose | API | Method |
-|---------|-----|--------|
-| Get access token | `api.dingtalk.com/v1.0/oauth2/accessToken` | POST |
-| Send DM | `api.dingtalk.com/v1.0/robot/oToMessages/batchSend` | POST |
-| Send to group | `api.dingtalk.com/v1.0/robot/groupMessages/send` | POST |
-| Get file download URL | `api.dingtalk.com/v1.0/robot/messageFiles/download` | POST |
+| Purpose | API | Method | Notes |
+|---------|-----|--------|-------|
+| Get access token | `api.dingtalk.com/v1.0/oauth2/accessToken` | POST | |
+| Send DM | `api.dingtalk.com/v1.0/robot/oToMessages/batchSend` | POST | msgKey: sampleText, sampleImageMsg, sampleFile, sampleLink |
+| Send to group | `api.dingtalk.com/v1.0/robot/groupMessages/send` | POST | Same msgKeys as DM |
+| Get file download URL | `api.dingtalk.com/v1.0/robot/messageFiles/download` | POST | Returns OSS signed URL, not file bytes |
+| Upload media | `oapi.dingtalk.com/media/upload?type={type}` | POST (multipart) | type=image (≤1MB), file (≤10MB), video (≤10MB) |
 
 ## DingTalk Stream Protocol
 
@@ -255,20 +256,48 @@ can be manually deleted afterward, or tagged for later cleanup.
 
 ### Sending to users (bot → user)
 - **Text**: Via `sampleText` msgKey (chunked at 20,000 chars)
-- **Screenshots**: `[SCREENSHOT:key]` markers in AgentCore responses are extracted, images fetched from S3, sent via `sampleImageMsg` with presigned S3 URLs (1h expiry)
-- **Images**: `[SEND_FILE:path]` markers with image extensions (.jpg/.png/.gif/.webp) sent inline via `sampleImageMsg` with presigned URL
-- **Files/Videos**: `[SEND_FILE:path]` markers with other extensions sent as link cards via `sampleLink` with presigned URL (1h expiry)
+- **Screenshots**: `[SCREENSHOT:key]` markers extracted, image bytes fetched from S3, uploaded to DingTalk via `media/upload?type=image`, sent via `sampleImageMsg` (permanent, inline preview). Falls back to `sampleFile` for screenshots >1MB
+- **Images ≤1MB** (.jpg/.png/.webp): Uploaded to DingTalk via `media/upload?type=image`, sent via `sampleImageMsg` (inline preview, permanent)
+- **Images >1MB** (.jpg/.png/.webp): Uploaded via `media/upload?type=file`, sent via `sampleFile` (native file, permanent)
+- **GIFs**: Always sent via `media/upload?type=file` → `sampleFile` (DingTalk `sampleImageMsg` doesn't render GIF animations)
+- **Files/Videos ≤10MB**: Uploaded to DingTalk via `media/upload?type=file`, sent via `sampleFile` msgKey (native file bubble, permanent)
+- **Files/Videos >10MB**: Fallback to `sampleLink` link card with presigned URL (1h expiry) — DingTalk OAPI `media/upload` hard limit is 10MB
+
+### Upload Flow (outbound, S3 → DingTalk)
+```
+1. Download file bytes from S3 (user's namespace)
+
+2. POST oapi.dingtalk.com/media/upload?access_token=TOKEN&type=file
+   Content-Type: multipart/form-data
+   Body: media=<file bytes>
+   Response: {"errcode": 0, "media_id": "@lAjPM3...", "type": "file"}
+
+3. Send via Robot API:
+   - sampleImageMsg: {"photoURL": "<media_id>"}  (images ≤1MB)
+   - sampleFile: {"mediaId": "<media_id>", "fileName": "...", "fileType": "..."}
+```
 
 ### `[SEND_FILE:path]` Marker Convention
-The agent can include `[SEND_FILE:relative_path]` in its response to send a file to the user.
+The agent includes `[SEND_FILE:relative_path]` in its response to send a file to the user.
 - `relative_path` is relative to the user's S3 namespace (e.g., `documents/report.pdf`, `_uploads/file_123.xlsx`)
-- The bridge validates the path (no `..` traversal), verifies the file exists in S3, and sends it
-- Images are sent inline; files/videos are sent as clickable link cards with file size info
+- The bridge validates the path (no `..` traversal), verifies the file exists in S3, and delivers via DingTalk native API
+- The marker is automatically stripped from the response text before sending
+
+### S3 URL Interception
+The bridge also detects raw S3 URLs (presigned or plain) in agent responses and automatically converts them to `[SEND_FILE:path]` markers. This is a safety net — the model sometimes generates S3 URLs via exec despite instructions to use `[SEND_FILE:path]`.
+
+### DingTalk OAPI Media Upload Limits
+| Type | Max Size |
+|------|----------|
+| image | 1 MB |
+| voice | 2 MB |
+| video | 10 MB |
+| file | 10 MB |
 
 ### Limitations
 - Files/videos are stored in S3 but not parsed — the agent is told about the file and can use `s3-user-files` tools to access it
 - Bedrock multimodal only supports images (jpeg, png, gif, webp) — video/audio/document content is not sent to the model directly
-- Outbound file delivery uses presigned URLs (1h expiry) via link cards — not native DingTalk file messages
+- Files >10MB fall back to presigned URL link cards (1h expiry) — DingTalk OAPI hard limit
 
 ## Scope Exclusions (v1)
 
@@ -277,4 +306,3 @@ Not in initial implementation:
 - Progress notification during long tasks
 - Markdown-to-DingTalk formatting conversion
 - Cron response screenshot/file delivery (cron Lambda lacks S3 access)
-- Native DingTalk file messages via OAPI media upload (currently uses presigned URL link cards)
