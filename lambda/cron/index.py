@@ -27,6 +27,7 @@ AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
+DINGTALK_SECRET_ID = os.environ.get("DINGTALK_SECRET_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
@@ -530,6 +531,84 @@ def send_feishu_message(receiver_id, text):
 
 
 
+def _get_dingtalk_credentials():
+    """Return (client_id, client_secret) from DingTalk secret."""
+    raw = _get_secret(DINGTALK_SECRET_ID)
+    if not raw:
+        return "", ""
+    try:
+        data = json.loads(raw)
+        return data.get("clientId", ""), data.get("clientSecret", "")
+    except (json.JSONDecodeError, TypeError):
+        return "", ""
+
+
+_dingtalk_token_cache = {"token": "", "expires_at": 0}
+
+
+def _get_dingtalk_access_token():
+    """Get or refresh DingTalk access token (7200s TTL, refresh 100s early)."""
+    if _dingtalk_token_cache["token"] and time.time() < _dingtalk_token_cache["expires_at"] - 100:
+        return _dingtalk_token_cache["token"]
+    client_id, client_secret = _get_dingtalk_credentials()
+    if not client_id or not client_secret:
+        logger.error("DingTalk clientId/clientSecret not configured")
+        return ""
+    url = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+    data = json.dumps({"appKey": client_id, "appSecret": client_secret}).encode()
+    req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        resp = urllib_request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        token = result.get("accessToken", "")
+        expire_in = result.get("expireIn", 7200)
+        if token:
+            _dingtalk_token_cache["token"] = token
+            _dingtalk_token_cache["expires_at"] = time.time() + expire_in
+            return token
+        logger.error("DingTalk access token missing from response")
+    except Exception as e:
+        logger.error("Failed to get DingTalk access token: %s", e)
+    return ""
+
+
+def send_dingtalk_message(receiver_id, text, is_group=False, conversation_id=None):
+    """Send a message via DingTalk Robot API."""
+    token = _get_dingtalk_access_token()
+    if not token:
+        logger.error("No DingTalk access token available")
+        return
+    client_id, _ = _get_dingtalk_credentials()
+    headers = {
+        "Content-Type": "application/json",
+        "x-acs-dingtalk-access-token": token,
+    }
+    MAX_LEN = 20000
+    chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)] if len(text) > MAX_LEN else [text]
+    for chunk in chunks:
+        if is_group:
+            url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+            body = json.dumps({
+                "robotCode": client_id,
+                "openConversationId": conversation_id or receiver_id,
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": chunk}),
+            }).encode()
+        else:
+            url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+            body = json.dumps({
+                "robotCode": client_id,
+                "userIds": [receiver_id],
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": chunk}),
+            }).encode()
+        req = urllib_request.Request(url, data=body, headers=headers)
+        try:
+            urllib_request.urlopen(req, timeout=15)
+        except Exception as e:
+            logger.error("Failed to send DingTalk message to %s: %s", receiver_id, e)
+
+
 def deliver_response(channel, channel_target, response_text):
     """Deliver a response to the user's channel."""
     response_text = _extract_text_from_content_blocks(response_text)
@@ -544,6 +623,14 @@ def deliver_response(channel, channel_target, response_text):
     elif channel == "slack":
         bot_token, _ = _get_slack_tokens()
         send_slack_message(channel_target, response_text, bot_token)
+    elif channel == "feishu":
+        send_feishu_message(channel_target, response_text)
+    elif channel == "dingtalk":
+        if channel_target.startswith("group:"):
+            conv_id = channel_target[6:]
+            send_dingtalk_message(conv_id, response_text, is_group=True, conversation_id=conv_id)
+        else:
+            send_dingtalk_message(channel_target, response_text)
     else:
         logger.warning("Unknown channel type: %s", channel)
 

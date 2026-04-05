@@ -544,7 +544,16 @@ const WORKSPACE_DEFAULTS = {
     "# Operating Instructions\n\n" +
     "- Be helpful, concise, and friendly\n" +
     "- Keep responses appropriate for chat messaging\n" +
-    "- If you don't know something, say so honestly\n",
+    "- If you don't know something, say so honestly\n\n" +
+    "## Sending Files to Users\n\n" +
+    "To send a file to the user's chat, include `[SEND_FILE:path]` in your response.\n" +
+    "Path is relative to the user's storage (e.g. `[SEND_FILE:documents/report.pdf]`).\n\n" +
+    "1. Write the file using write_user_file first\n" +
+    "2. Include `[SEND_FILE:path]` in your response — the bridge delivers it natively in chat\n\n" +
+    "CRITICAL: NEVER generate S3 URLs, presigned URLs, or download links.\n" +
+    "NEVER construct URLs like https://openclaw-user-files-*.s3.amazonaws.com/...\n" +
+    "NEVER say you cannot send files — ALL channels support native file delivery via [SEND_FILE:path].\n" +
+    "The [SEND_FILE:path] marker is stripped from your response before sending text.\n",
   "SOUL.md":
     "# Agent Persona\n\n" +
     "You are a helpful personal assistant powered by OpenClaw.\n" +
@@ -712,6 +721,8 @@ async function ensureWorkspaceFiles(namespace, rawContents) {
 const VALID_CHANNELS = new Set([
   "telegram",
   "slack",
+  "dingtalk",
+  "feishu",
   "discord",
   "whatsapp",
   "unknown",

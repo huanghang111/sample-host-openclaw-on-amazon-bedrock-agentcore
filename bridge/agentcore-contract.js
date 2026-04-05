@@ -104,6 +104,12 @@ let activeTaskCount = 0;
 let messageQueue = [];
 let processingMessage = false;
 
+// Warm-up conversation history — accumulated during lightweight agent phase,
+// injected into OpenClaw on first post-handoff message for continuity.
+const MAX_WARMUP_HISTORY = 20; // 10 exchanges max
+let warmupHistory = [];
+const WARMUP_FOOTER_MARKER = "\n\n---\n_Warm-up mode";
+
 /**
  * Write current actorId and channel to a shared file so the proxy process
  * can pick up cross-channel identity changes (the proxy's env vars are
@@ -412,7 +418,7 @@ function writeOpenClawConfig() {
         "",
         "## Response Formatting",
         "",
-        "Format responses for chat messaging apps (Telegram, Slack):",
+        "Format responses for chat messaging apps (Telegram, Slack, DingTalk, Feishu):",
         "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
         "- Tables do not render in most chat apps; bullets always work",
         "- Keep responses concise and chat-appropriate",
@@ -445,6 +451,27 @@ function writeOpenClawConfig() {
         "## File Storage",
         "",
         "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
+        "",
+        "## Sending Files to Users",
+        "",
+        "To send a file to the user's chat, include `[SEND_FILE:path]` in your response.",
+        "The path is relative to the user's storage namespace.",
+        "",
+        "**How to send a file:**",
+        "1. Write the file using s3-user-files (e.g., `node /skills/s3-user-files/write.js <user_id> documents/report.pdf <content>`)",
+        "2. Include `[SEND_FILE:documents/report.pdf]` in your response text",
+        "3. The messaging bridge automatically delivers the file natively in chat",
+        "",
+        "**Examples:**",
+        "- `[SEND_FILE:documents/report.pdf]` — native file download in chat",
+        "- `[SEND_FILE:_uploads/img_123.jpg]` — sent as inline image",
+        "- `[SEND_FILE:data/export.xlsx]` — native file download in chat",
+        "",
+        "**CRITICAL RULES:**",
+        "- ALWAYS use `[SEND_FILE:path]` to deliver files. NEVER generate S3 URLs, presigned URLs, or download links.",
+        "- NEVER say you cannot send files or that the channel has limitations — ALL channels support native file delivery via this marker.",
+        "- NEVER construct S3 bucket URLs (e.g., https://openclaw-user-files-....s3.amazonaws.com/...) — these are internal and inaccessible to users.",
+        "- The `[SEND_FILE:path]` marker is automatically stripped from your response before sending the text.",
         "",
         "## Community Skills (ClawHub)",
         "",
@@ -1038,10 +1065,10 @@ function extractTextFromContent(content) {
         return extractTextFromContent(leading + text);
       }
     }
-    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"...")
+    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"..." or "[{\"")
     // These are partial content blocks from streaming that shouldn't leak as response text
     if (trimmed.startsWith("[{") && !trimmed.endsWith("]")) {
-      if (/^\[\{\s*"type"\s*:/.test(trimmed) || trimmed === "[{") {
+      if (/^\[\{\s*"/.test(trimmed) || trimmed === "[{") {
         return "";
       }
     }
@@ -1335,6 +1362,32 @@ async function bridgeMessage(message, timeoutMs = 560000) {
 }
 
 /**
+ * Strip the warm-up footer from a lightweight agent response
+ * before storing in warmupHistory (OpenClaw shouldn't see this metadata).
+ */
+function stripWarmupFooter(text) {
+  if (!text) return "";
+  const idx = text.indexOf(WARMUP_FOOTER_MARKER);
+  return idx >= 0 ? text.slice(0, idx) : text;
+}
+
+/**
+ * Format accumulated warm-up history as a context prefix for OpenClaw.
+ * Injected into the first post-handoff message so OpenClaw has continuity.
+ */
+function formatWarmupHistory(history) {
+  if (!history || history.length === 0) return "";
+  const lines = history.map(
+    (m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`,
+  );
+  return (
+    "[Previous conversation during startup — please maintain context continuity:]\n" +
+    lines.join("\n\n") +
+    "\n\n[Current message:]\n"
+  );
+}
+
+/**
  * Build bridge text from message payload.
  * Handles structured messages with images and plain text.
  */
@@ -1610,8 +1663,18 @@ const server = http.createServer(async (req, res) => {
             // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
+              // Inject warm-up conversation history on first OpenClaw message
+              let messageToBridge = bridgeText;
+              if (warmupHistory.length > 0) {
+                messageToBridge =
+                  formatWarmupHistory(warmupHistory) + bridgeText;
+                warmupHistory = [];
+                console.log(
+                  "[contract] Injected warm-up history into first OpenClaw message",
+                );
+              }
               try {
-                responseText = await enqueueMessage(bridgeText);
+                responseText = await enqueueMessage(messageToBridge);
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
@@ -1638,7 +1701,20 @@ const server = http.createServer(async (req, res) => {
               // Warm-up shim path — lightweight agent via proxy
               console.log("[contract] Routing via lightweight agent (warm-up)");
               try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
+                responseText = await agent.chat(
+                  bridgeText,
+                  actorId,
+                  Date.now() + 560000,
+                  warmupHistory,
+                );
+                // Accumulate history for OpenClaw handoff (strip warm-up footer)
+                if (warmupHistory.length < MAX_WARMUP_HISTORY) {
+                  warmupHistory.push({ role: "user", content: bridgeText });
+                  warmupHistory.push({
+                    role: "assistant",
+                    content: stripWarmupFooter(responseText),
+                  });
+                }
               } catch (agentErr) {
                 responseText = `I'm having trouble right now. Please try again in a moment.`;
                 console.error(
