@@ -22,7 +22,7 @@ from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
 from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
-from stacks.dingtalk_stack import DingTalkStack
+from stacks.ws_bridge_stack import WsBridgeStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
 
@@ -100,28 +100,34 @@ cron_stack = CronStack(
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
     feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
     dingtalk_token_secret_name=security_stack.channel_secrets["dingtalk"].secret_name,
+    ws_bridge_bots_secret_name=security_stack.ws_bridge_bots_secret.secret_name,
     cmk_arn=security_stack.cmk.key_arn,
     agentcore_execution_role=agentcore_stack.execution_role,
     env=env,
 )
 
-# --- DingTalk Bridge (ECS Fargate — Stream mode WebSocket) ---
-dingtalk_stack = DingTalkStack(
-    app,
-    "OpenClawDingTalk",
-    vpc=vpc_stack.vpc,
-    private_subnet_ids=[s.subnet_id for s in vpc_stack.vpc.private_subnets],
-    vpce_security_group_id=vpc_stack.vpce_sg.security_group_id,
-    runtime_arn=agentcore_stack.runtime_arn,
-    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
-    identity_table_name=_identity_table_name,
-    identity_table_arn=_identity_table_arn,
-    dingtalk_token_secret_name=security_stack.channel_secrets["dingtalk"].secret_name,
-    cmk_arn=security_stack.cmk.key_arn,
-    user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
-    user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
-    env=env,
-)
+# --- WS Bridge (ECS Fargate — multi-bot DingTalk + Feishu WebSocket) ---
+# Replaces the legacy single-bot DingTalkStack.
+# Opt-in via ws_bridge_enabled in cdk.json context.
+_ws_bridge_enabled = str(app.node.try_get_context("ws_bridge_enabled") or "false").lower() == "true"
+ws_bridge_stack = None
+if _ws_bridge_enabled:
+    ws_bridge_stack = WsBridgeStack(
+        app,
+        "OpenClawWsBridge",
+        vpc=vpc_stack.vpc,
+        private_subnet_ids=[s.subnet_id for s in vpc_stack.vpc.private_subnets],
+        vpce_security_group_id=vpc_stack.vpce_sg.security_group_id,
+        runtime_arn=agentcore_stack.runtime_arn,
+        runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
+        identity_table_name=_identity_table_name,
+        identity_table_arn=_identity_table_arn,
+        ws_bridge_bots_secret_name=security_stack.ws_bridge_bots_secret.secret_name,
+        cmk_arn=security_stack.cmk.key_arn,
+        user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
+        user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
+        env=env,
+    )
 
 # --- Observability (dashboards + alarms) ---
 observability_stack = ObservabilityStack(

@@ -290,6 +290,16 @@ This displays the webhook URL for Slack Event Subscriptions, prompts for your Sl
 ```
 This displays the webhook URL, guides you through Feishu developer console setup (app creation, permissions, events, publishing), stores credentials in Secrets Manager, and adds you to the allowlist. Store credentials format: `{"appId":"...","appSecret":"...","verificationToken":"...","encryptKey":"..."}`
 
+### Multi-Bot WS Bridge Setup (DingTalk + Feishu WebSocket)
+```bash
+./scripts/setup-multi-bot.sh              # Interactive menu
+./scripts/setup-multi-bot.sh add          # Add a DingTalk or Feishu bot
+./scripts/setup-multi-bot.sh list         # List configured bots
+./scripts/setup-multi-bot.sh remove       # Remove a bot
+./scripts/setup-multi-bot.sh restart      # Force ECS redeployment
+```
+Manages the `openclaw/ws-bridge/bots` secret in Secrets Manager. Supports multiple DingTalk and Feishu bot instances in a single ECS Fargate service. Feishu bots use WebSocket mode (not HTTP webhook). Note: Feishu `open_id` is app-scoped — each bot sees a different ID for the same user, requiring separate allowlist entries per bot.
+
 ### Deploy New Bridge Version (Starter Toolkit — preferred)
 
 The project uses **CDK + AgentCore Starter Toolkit hybrid deployment**:
@@ -416,10 +426,13 @@ cd bridge && node --test browser-lifecycle.test.js     # browser session lifecyc
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
-### DingTalk Bridge Tests
+### DingTalk Bridge Tests (legacy)
 ```bash
 cd dingtalk-bridge && source ../.venv/bin/activate && python -m unittest test_media -v  # media download/upload/screenshot tests (28 tests)
 ```
+
+### WS Bridge (Multi-Bot)
+The WS Bridge (`ws-bridge/`) replaces the single-bot DingTalk bridge with a multi-bot service supporting both DingTalk and Feishu via WebSocket. CDK stack: `OpenClawWsBridge` (opt-in via `ws_bridge_enabled: true` in `cdk.json`). See `docs/design-multi-bot-bridge.md` for full architecture.
 
 ### Router Lambda Tests
 ```bash

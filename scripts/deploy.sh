@@ -4,7 +4,7 @@
 # Three-phase deployment:
 #   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
 #   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build, Runtime, Endpoint)
-#   Phase 3: CDK deploys dependent stacks (Router, Cron, DingTalk, TokenMonitoring)
+#   Phase 3: CDK deploys dependent stacks (Router, Cron, WsBridge, TokenMonitoring)
 #
 # Usage:
 #   ./scripts/deploy.sh                  # full 3-phase deploy
@@ -152,12 +152,22 @@ cleanup_orphaned_resources() {
       fi
     done
   fi
+  # Clean up orphaned DingTalk bridge log group (replaced by WS Bridge)
   if ! aws cloudformation describe-stacks --stack-name OpenClawDingTalk --region "$REGION" &>/dev/null; then
     local DT_LOG="/openclaw/dingtalk-bridge"
     if aws logs describe-log-groups --log-group-name-prefix "$DT_LOG" --region "$REGION" \
        --query "logGroups[?logGroupName=='$DT_LOG'].logGroupName" --output text 2>/dev/null | grep -q .; then
       echo "  Deleting orphaned log group: $DT_LOG"
       aws logs delete-log-group --log-group-name "$DT_LOG" --region "$REGION"
+    fi
+  fi
+  # Clean up orphaned WS Bridge log group
+  if ! aws cloudformation describe-stacks --stack-name OpenClawWsBridge --region "$REGION" &>/dev/null; then
+    local WS_LOG="/openclaw/ws-bridge"
+    if aws logs describe-log-groups --log-group-name-prefix "$WS_LOG" --region "$REGION" \
+       --query "logGroups[?logGroupName=='$WS_LOG'].logGroupName" --output text 2>/dev/null | grep -q .; then
+      echo "  Deleting orphaned log group: $WS_LOG"
+      aws logs delete-log-group --log-group-name "$WS_LOG" --region "$REGION"
     fi
   fi
 
@@ -526,6 +536,7 @@ with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
 m = re.search(r'agent_id:\s*(\S+)', text)
 print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
+  fi
 
   if [ -z "$RUNTIME_ID" ]; then
     echo "WARNING: Could not extract runtime_id from toolkit config. You may need to set it manually in cdk.json."
@@ -588,7 +599,7 @@ phase3_cdk() {
   cdk deploy \
     OpenClawRouter \
     OpenClawCron \
-    OpenClawDingTalk \
+    OpenClawWsBridge \
     OpenClawTokenMonitoring \
     --require-approval never
 
@@ -620,7 +631,7 @@ esac
 echo "=== Deploy complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Set up Telegram:  ./scripts/setup-telegram.sh"
-echo "  2. Set up Slack:     ./scripts/setup-slack.sh"
-echo "  3. Set up Feishu:    ./scripts/setup-feishu.sh"
-echo "  4. Set up DingTalk:  ./scripts/setup-dingtalk.sh"
+echo "  1. Set up Telegram:          ./scripts/setup-telegram.sh"
+echo "  2. Set up Slack:             ./scripts/setup-slack.sh"
+echo "  3. Set up Feishu (webhook):  ./scripts/setup-feishu.sh"
+echo "  4. Set up DingTalk/Feishu (WS multi-bot): ./scripts/setup-multi-bot.sh"

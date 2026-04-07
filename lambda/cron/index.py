@@ -28,6 +28,9 @@ IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 DINGTALK_SECRET_ID = os.environ.get("DINGTALK_SECRET_ID", "")
+FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
+FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
+WS_BRIDGE_BOTS_SECRET_ID = os.environ.get("WS_BRIDGE_BOTS_SECRET_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
@@ -609,8 +612,178 @@ def send_dingtalk_message(receiver_id, text, is_group=False, conversation_id=Non
             logger.error("Failed to send DingTalk message to %s: %s", receiver_id, e)
 
 
-def deliver_response(channel, channel_target, response_text):
-    """Deliver a response to the user's channel."""
+# ---------------------------------------------------------------------------
+# WS Bridge bot-aware credential resolution
+# ---------------------------------------------------------------------------
+
+_ws_bots_cache = {"configs": None, "fetched_at": 0}
+
+
+def _get_ws_bot_configs():
+    """Load and cache WS Bridge bot configs from Secrets Manager."""
+    if _ws_bots_cache["configs"] is not None and time.time() - _ws_bots_cache["fetched_at"] < _SECRET_CACHE_TTL_SECONDS:
+        return _ws_bots_cache["configs"]
+
+    if not WS_BRIDGE_BOTS_SECRET_ID:
+        return []
+
+    raw = _get_secret(WS_BRIDGE_BOTS_SECRET_ID)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        configs = data.get("bots", [])
+        _ws_bots_cache["configs"] = configs
+        _ws_bots_cache["fetched_at"] = time.time()
+        return configs
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _find_ws_bot(bot_id):
+    """Find a specific bot config by ID from the WS Bridge configs."""
+    for bot in _get_ws_bot_configs():
+        if bot.get("id") == bot_id and bot.get("enabled", True):
+            return bot
+    return None
+
+
+def _find_ws_bot_for_channel(channel):
+    """Find any enabled bot for a given channel from WS Bridge configs."""
+    for bot in _get_ws_bot_configs():
+        if bot.get("channel") == channel and bot.get("enabled", True):
+            return bot
+    return None
+
+
+def _resolve_bot_credentials(user_id, channel):
+    """Resolve bot credentials with 3-level fallback.
+
+    1. User's preferred bot (lastBotId from DynamoDB SESSION record)
+    2. Any enabled bot for this channel from WS Bridge config
+    3. Legacy per-channel secret (openclaw/channels/{channel})
+
+    Returns (credentials_dict, source_description) or (None, None).
+    """
+    # Level 1: Preferred bot
+    try:
+        resp = identity_table.get_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"})
+        last_bot_id = resp.get("Item", {}).get("lastBotId", "")
+        if last_bot_id:
+            bot = _find_ws_bot(last_bot_id)
+            if bot:
+                return bot["credentials"], f"ws-bridge:{last_bot_id}"
+    except Exception as e:
+        logger.warning("Failed to lookup lastBotId for %s: %s", user_id, e)
+
+    # Level 2: Any enabled bot for this channel
+    bot = _find_ws_bot_for_channel(channel)
+    if bot:
+        return bot["credentials"], f"ws-bridge:{bot['id']}(fallback)"
+
+    # Level 3: Legacy per-channel secret
+    return None, None  # Caller falls back to legacy credential loading
+
+
+def _send_dingtalk_with_creds(receiver_id, text, creds, is_group=False, conversation_id=None):
+    """Send DingTalk message using specific bot credentials."""
+    client_id = creds.get("clientId", "")
+    client_secret = creds.get("clientSecret", "")
+    if not client_id or not client_secret:
+        logger.error("DingTalk credentials missing clientId/clientSecret")
+        return
+
+    # Get access token for these specific credentials
+    url = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+    data = json.dumps({"appKey": client_id, "appSecret": client_secret}).encode()
+    req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        resp = urllib_request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        token = result.get("accessToken", "")
+    except Exception as e:
+        logger.error("Failed to get DingTalk access token for bot: %s", e)
+        return
+
+    if not token:
+        return
+
+    headers = {"Content-Type": "application/json", "x-acs-dingtalk-access-token": token}
+    MAX_LEN = 20000
+    chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)] if len(text) > MAX_LEN else [text]
+    for chunk in chunks:
+        if is_group:
+            api_url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+            body = json.dumps({
+                "robotCode": client_id,
+                "openConversationId": conversation_id or receiver_id,
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": chunk}),
+            }).encode()
+        else:
+            api_url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+            body = json.dumps({
+                "robotCode": client_id,
+                "userIds": [receiver_id],
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": chunk}),
+            }).encode()
+        req = urllib_request.Request(api_url, data=body, headers=headers)
+        try:
+            urllib_request.urlopen(req, timeout=15)
+        except Exception as e:
+            logger.error("Failed to send DingTalk message to %s: %s", receiver_id, e)
+
+
+def _send_feishu_with_creds(receiver_id, text, creds):
+    """Send Feishu message using specific bot credentials."""
+    app_id = creds.get("appId", "")
+    app_secret = creds.get("appSecret", "")
+    if not app_id or not app_secret:
+        logger.error("Feishu credentials missing appId/appSecret")
+        return
+
+    # Get tenant_access_token for these specific credentials
+    url = f"{FEISHU_API_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal"
+    data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        resp = urllib_request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        token = result.get("tenant_access_token", "")
+    except Exception as e:
+        logger.error("Failed to get Feishu tenant token for bot: %s", e)
+        return
+
+    if not token:
+        return
+
+    id_type = "open_id" if receiver_id.startswith("ou_") else "chat_id"
+    api_url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={id_type}"
+    MAX_LEN = 20000
+    chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)] if len(text) > MAX_LEN else [text]
+    for chunk in chunks:
+        body = json.dumps({
+            "receive_id": receiver_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": chunk}),
+        }).encode()
+        req = urllib_request.Request(api_url, data=body, headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        })
+        try:
+            urllib_request.urlopen(req, timeout=10)
+        except Exception as e:
+            logger.error("Failed to send Feishu message to %s: %s", receiver_id, e)
+
+
+def deliver_response(channel, channel_target, response_text, user_id=None):
+    """Deliver a response to the user's channel.
+
+    For DingTalk and Feishu, attempts bot-aware delivery using lastBotId from
+    DynamoDB, falling back to legacy per-channel secrets.
+    """
     response_text = _extract_text_from_content_blocks(response_text)
 
     if channel == "telegram":
@@ -623,14 +796,33 @@ def deliver_response(channel, channel_target, response_text):
     elif channel == "slack":
         bot_token, _ = _get_slack_tokens()
         send_slack_message(channel_target, response_text, bot_token)
-    elif channel == "feishu":
-        send_feishu_message(channel_target, response_text)
-    elif channel == "dingtalk":
-        if channel_target.startswith("group:"):
-            conv_id = channel_target[6:]
-            send_dingtalk_message(conv_id, response_text, is_group=True, conversation_id=conv_id)
+    elif channel in ("feishu", "dingtalk"):
+        # Try bot-aware delivery first (WS Bridge multi-bot)
+        creds, source = (None, None)
+        if user_id:
+            creds, source = _resolve_bot_credentials(user_id, channel)
+
+        if creds:
+            logger.info("Delivering cron response via %s for channel=%s", source, channel)
+            if channel == "dingtalk":
+                if channel_target.startswith("group:"):
+                    conv_id = channel_target[6:]
+                    _send_dingtalk_with_creds(conv_id, response_text, creds,
+                                              is_group=True, conversation_id=conv_id)
+                else:
+                    _send_dingtalk_with_creds(channel_target, response_text, creds)
+            else:
+                _send_feishu_with_creds(channel_target, response_text, creds)
         else:
-            send_dingtalk_message(channel_target, response_text)
+            # Legacy fallback: use per-channel secrets
+            if channel == "dingtalk":
+                if channel_target.startswith("group:"):
+                    conv_id = channel_target[6:]
+                    send_dingtalk_message(conv_id, response_text, is_group=True, conversation_id=conv_id)
+                else:
+                    send_dingtalk_message(channel_target, response_text)
+            else:
+                send_feishu_message(channel_target, response_text)
     else:
         logger.warning("Unknown channel type: %s", channel)
 
@@ -719,7 +911,7 @@ def handler(event, context):
             "Your scheduled task could not run because the agent failed to start. "
             "It will try again at the next scheduled time."
         )
-        deliver_response(channel, channel_target, error_msg)
+        deliver_response(channel, channel_target, error_msg, user_id=current_user_id)
         return {"statusCode": 503, "body": "Warmup timeout"}
 
     # Phase 3: Execute the cron message
@@ -729,7 +921,7 @@ def handler(event, context):
 
     # Phase 4: Deliver response to channel
     logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
-    deliver_response(channel, channel_target, response_text)
+    deliver_response(channel, channel_target, response_text, user_id=current_user_id)
 
     logger.info("Cron execution complete: schedule=%s", schedule_id)
     return {"statusCode": 200, "body": "OK"}
