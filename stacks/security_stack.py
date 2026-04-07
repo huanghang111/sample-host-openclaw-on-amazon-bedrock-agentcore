@@ -62,7 +62,7 @@ class SecurityStack(Stack):
         )
 
         # --- Channel bot token placeholders -------------------------------
-        channel_names = ["whatsapp", "telegram", "discord", "slack", "feishu"]
+        channel_names = ["whatsapp", "telegram", "discord", "slack", "feishu", "dingtalk"]
         self.channel_secrets: dict[str, secretsmanager.Secret] = {}
         for channel in channel_names:
             self.channel_secrets[channel] = secretsmanager.Secret(
@@ -178,8 +178,23 @@ class SecurityStack(Stack):
             ),
         )
 
+        # --- WS Bridge bot configuration secret ----------------------------
+        # Stores JSON array of bot configs (DingTalk + Feishu WebSocket bots).
+        # Placeholder value — replace via console/CLI with actual bot credentials.
+        self.ws_bridge_bots_secret = secretsmanager.Secret(
+            self,
+            "WsBridgeBotsSecret",
+            secret_name="openclaw/ws-bridge/bots",
+            description="Multi-bot WebSocket bridge configuration (DingTalk + Feishu bots)",
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=32,
+                exclude_punctuation=True,
+            ),  # placeholder — replace with actual bot config JSON
+        )
+
         # --- cdk-nag suppressions ---
-        all_secrets = [self.gateway_token_secret, self.cognito_password_secret, self.webhook_secret] + list(self.channel_secrets.values())
+        all_secrets = [self.gateway_token_secret, self.cognito_password_secret, self.webhook_secret, self.ws_bridge_bots_secret] + list(self.channel_secrets.values())
         cdk_nag.NagSuppressions.add_resource_suppressions(
             all_secrets,
             [

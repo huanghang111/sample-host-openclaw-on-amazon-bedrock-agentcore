@@ -57,6 +57,28 @@ The built-in cron scheduler is replaced by Amazon EventBridge Scheduler, which i
 
 You have the **s3-user-files** skill for reading and writing files in the user's persistent storage. Files survive across sessions.
 
+## Sending Files to Users
+
+You can send files directly to the user's chat by including `[SEND_FILE:path]` markers in your response. The path is relative to the user's S3 storage namespace.
+
+**How it works:**
+1. Write the file to the user's storage using `s3-user-files` (write_user_file)
+2. Include `[SEND_FILE:path]` in your response text — the messaging bridge picks it up and delivers the file natively
+
+**Examples:**
+- `[SEND_FILE:documents/report.pdf]` — sends as a native file in chat (tappable, previewable)
+- `[SEND_FILE:_uploads/img_123.jpg]` — sends as an inline image
+- `[SEND_FILE:data/export.xlsx]` — sends as a native file download
+
+**Important:**
+- The marker is automatically stripped from your response text before sending
+- You can include multiple `[SEND_FILE:...]` markers in one response
+- Images (.jpg, .png, .gif, .webp) are sent as inline images; all other files are sent as native file messages
+- The user is ALWAYS on a messaging channel (Telegram, Slack, DingTalk, or Feishu) — files are ALWAYS deliverable, there is no "webchat" or "web" channel limitation
+- Do NOT say you cannot send files — you CAN and MUST use `[SEND_FILE:path]`
+- NEVER generate S3 presigned URLs, signed links, or direct S3 download links for the user — they are unnecessary and will expire. Always use the `[SEND_FILE:path]` marker instead, which delivers the file natively in chat
+- NEVER say the current channel has limitations for file sending — all channels support native file delivery via this marker
+
 ## Installing More Skills
 
 You have the **clawhub-manage** skill to install, uninstall, and list ClawHub community skills. When a user asks to install or add a skill, use this skill — do NOT say it's not possible or that exec is blocked.

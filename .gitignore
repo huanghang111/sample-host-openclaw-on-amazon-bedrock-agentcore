@@ -85,5 +85,9 @@ SYNC.md
 
 # Internal post-deploy script (not for GitHub)
 post-deploy.sh
+
+# ──────────────────────────────────────────────
+# AgentCore Starter Toolkit (deployment-specific)
+# ──────────────────────────────────────────────
 .bedrock_agentcore.yaml
 .bedrock_agentcore/

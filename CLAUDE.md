@@ -290,6 +290,16 @@ This displays the webhook URL for Slack Event Subscriptions, prompts for your Sl
 ```
 This displays the webhook URL, guides you through Feishu developer console setup (app creation, permissions, events, publishing), stores credentials in Secrets Manager, and adds you to the allowlist. Store credentials format: `{"appId":"...","appSecret":"...","verificationToken":"...","encryptKey":"..."}`
 
+### Multi-Bot WS Bridge Setup (DingTalk + Feishu WebSocket)
+```bash
+./scripts/setup-multi-bot.sh              # Interactive menu
+./scripts/setup-multi-bot.sh add          # Add a DingTalk or Feishu bot
+./scripts/setup-multi-bot.sh list         # List configured bots
+./scripts/setup-multi-bot.sh remove       # Remove a bot
+./scripts/setup-multi-bot.sh restart      # Force ECS redeployment
+```
+Manages the `openclaw/ws-bridge/bots` secret in Secrets Manager. Supports multiple DingTalk and Feishu bot instances in a single ECS Fargate service. Feishu bots use WebSocket mode (not HTTP webhook). Note: Feishu `open_id` is app-scoped — each bot sees a different ID for the same user, requiring separate allowlist entries per bot.
+
 ### Deploy New Bridge Version (Starter Toolkit — preferred)
 
 The project uses **CDK + AgentCore Starter Toolkit hybrid deployment**:
@@ -415,6 +425,14 @@ cd bridge && node --test agentcore-browser.test.js     # browser skill unit test
 cd bridge && node --test browser-lifecycle.test.js     # browser session lifecycle tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
+
+### DingTalk Bridge Tests (legacy)
+```bash
+cd dingtalk-bridge && source ../.venv/bin/activate && python -m unittest test_media -v  # media download/upload/screenshot tests (28 tests)
+```
+
+### WS Bridge (Multi-Bot)
+The WS Bridge (`ws-bridge/`) replaces the single-bot DingTalk bridge with a multi-bot service supporting both DingTalk and Feishu via WebSocket. CDK stack: `OpenClawWsBridge` (opt-in via `ws_bridge_enabled: true` in `cdk.json`). See `docs/design-multi-bot-bridge.md` for full architecture.
 
 ### Router Lambda Tests
 ```bash
@@ -679,6 +697,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Supported types**: `image/jpeg`, `image/png`, `image/gif`, `image/webp` (max 3.75 MB per Bedrock limit)
 - **Security**: S3 key validated against user's namespace prefix + path traversal (`..`) rejection. Format validated against `VALID_BEDROCK_FORMATS` set
 - **Slack prerequisite**: Bot needs `files:read` OAuth scope to download image files
+- **DingTalk two-step download**: DingTalk `messageFiles/download` API returns `{downloadUrl}` (Alibaba OSS signed URL), NOT file bytes. Must fetch the URL first, then download bytes from it. OSS URLs may use HTTP — upgrade to HTTPS since ECS SG only allows port 443
+- **DingTalk media types**: `picture` → multimodal (same as Telegram/Slack), `file`/`video` → stored in S3 with text notification to agent (Bedrock doesn't support non-image multimodal)
 
 ### Workspace Sync
 - **S3 prefix**: `{namespace}/.openclaw/` where `namespace = actorId.replace(/:/g, "_")`
@@ -783,6 +803,10 @@ To add a new messaging channel (e.g., WhatsApp, Discord, LINE), follow the Feish
 ### VPC + Bedrock
 - **Cross-region inference profiles work through VPC endpoints**: `global.anthropic.claude-opus-4-6-v1` works fine through `bedrock-runtime` VPC endpoint (despite initial suspicion otherwise)
 - **Security group egress**: TCP 443 only is sufficient — DNS uses VPC internal resolver (not affected by SG)
+
+### S3 Bucket
+- **RETAIN policy drift**: S3 user-files bucket has `RemovalPolicy.RETAIN` — CDK won't recreate it if deleted externally. `deploy.sh` verifies bucket existence after Phase 1 and recreates if missing
+- **Bucket name**: `openclaw-user-files-{account}-{region}` — deterministic, shared by all channels
 
 ### Session Management
 - **Session ID is deterministic**: `ses_{userId}_{hash}` — same user always gets same session ID, so `stop-session` with the correct ID is essential after config changes
