@@ -137,6 +137,63 @@ class FeishuAdapter(ChannelAdapter):
             logger.warning("bot=%s Failed to fetch bot info: %s", self.config.id, e)
 
     # ------------------------------------------------------------------
+    # Typing indicator (message reaction)
+    # ------------------------------------------------------------------
+
+    def _add_typing_reaction(self, message_id: str) -> str:
+        """Add a 'TYPING' emoji reaction to acknowledge message receipt.
+
+        Returns the reaction_id for later removal, or empty string on failure.
+        Following the official openclaw-lark plugin pattern.
+        """
+        if not self._lark_client or not message_id:
+            return ""
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            from lark_oapi.api.im.v1.model.emoji import Emoji
+            emoji = Emoji.builder().emoji_type("OnIt").build()
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(emoji)
+                .build()
+            )
+            req = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+            resp = self._lark_client.im.v1.message_reaction.create(req)
+            if resp.success() and resp.data:
+                reaction_id = resp.data.reaction_id or ""
+                return reaction_id
+            else:
+                logger.info("bot=%s Typing reaction failed: code=%s msg=%s",
+                            self.config.id, resp.code if resp else "?", resp.msg if resp else "?")
+        except Exception as e:
+            logger.info("bot=%s Failed to add typing reaction: %s", self.config.id, e)
+        return ""
+
+    def _remove_typing_reaction(self, message_id: str, reaction_id: str):
+        """Remove the typing reaction after processing is complete."""
+        if not self._lark_client or not message_id or not reaction_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            req = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            self._lark_client.im.v1.message_reaction.delete(req)
+        except Exception:
+            pass  # Best-effort removal
+
+    # ------------------------------------------------------------------
     # Message handler
     # ------------------------------------------------------------------
 
@@ -197,8 +254,16 @@ class FeishuAdapter(ChannelAdapter):
                          self.config.id, msg_type,
                          msg.sender_id[:20] if msg.sender_id else "?", is_group)
 
-            # Process synchronously in this thread (boto3 is sync)
-            self.core.process_message(self, msg)
+            # Add "Typing" reaction as instant acknowledgment
+            reaction_id = self._add_typing_reaction(message.message_id)
+
+            try:
+                # Process synchronously in this thread (boto3 is sync)
+                self.core.process_message(self, msg)
+            finally:
+                # Remove typing reaction after processing
+                if reaction_id:
+                    self._remove_typing_reaction(message.message_id, reaction_id)
 
         except Exception:
             logger.error("bot=%s Error handling Feishu message", self.config.id,
