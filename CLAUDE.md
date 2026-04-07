@@ -434,6 +434,8 @@ cd dingtalk-bridge && source ../.venv/bin/activate && python -m unittest test_me
 ### WS Bridge (Multi-Bot)
 The WS Bridge (`ws-bridge/`) replaces the single-bot DingTalk bridge with a multi-bot service supporting both DingTalk and Feishu via WebSocket. CDK stack: `OpenClawWsBridge` (opt-in via `ws_bridge_enabled: true` in `cdk.json`). See `docs/design-multi-bot-bridge.md` for full architecture.
 
+**Typing indicators**: On message receipt, DingTalk shows a 🤔思考中 emotion (via `/v1.0/robot/emotion/reply`), Feishu shows an `OnIt` emoji reaction (via `im.v1.message_reaction.create`). Both are removed after response. Feishu reactions require `im:message:reaction` permission.
+
 ### Router Lambda Tests
 ```bash
 cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
