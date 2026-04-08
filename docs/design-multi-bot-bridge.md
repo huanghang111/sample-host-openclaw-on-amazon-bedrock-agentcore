@@ -394,7 +394,7 @@ File: `stacks/ws_bridge_stack.py` — replaces `stacks/dingtalk_stack.py` (legac
 | ECS Cluster | `openclaw-ws-bridge` |
 | Service | `openclaw-ws-bridge` |
 | Log group | `/openclaw/ws-bridge` |
-| Docker context | `ws-bridge/` |
+| ECR repo | `openclaw-ws-bridge` (created by deploy.sh) |
 | Task def | ARM64, 256 CPU / 512 MB (configurable) |
 
 **Opt-in** via `ws_bridge_enabled: true` in `cdk.json`. When disabled, no ECS resources are created.
@@ -436,13 +436,41 @@ Same as the old DingTalk bridge — both channels need identical AWS access:
 
 ### 5.5 Deploy Script
 
-`scripts/deploy.sh` deploys the WS Bridge in **Phase 3** (dependent stacks):
+`scripts/deploy.sh` deploys the WS Bridge image via **CodeBuild** (no local Docker required), then deploys the ECS service via CDK in Phase 3:
 
 ```
 Phase 1: OpenClawVpc, OpenClawSecurity, OpenClawGuardrails, OpenClawAgentCore, OpenClawObservability
-Phase 2: Starter Toolkit (Runtime, ECR, Docker build)
+Phase 2: Starter Toolkit (Runtime, ECR, Docker build for main bridge)
+WS Bridge image build (CodeBuild, ARM64) ← runs before Phase 3
 Phase 3: OpenClawRouter, OpenClawCron, OpenClawWsBridge, OpenClawTokenMonitoring
 ```
+
+#### WS Bridge Image Build Flow
+
+The image build is fully automated by `deploy.sh` and uses **AWS CodeBuild** with ARM64 compute — no local Docker installation needed:
+
+1. **ECR repository** `openclaw-ws-bridge` created if not exists
+2. **CodeBuild project** `openclaw-ws-bridge-build` created if not exists (with IAM role for ECR push, S3 source read, CloudWatch Logs)
+3. **Source zip** of `ws-bridge/` uploaded to S3 (`_build/ws-bridge-source.zip`)
+4. **Content-based image tag** computed from source hash (`build-{hash}`) — CDK detects tag changes and redeploys ECS automatically
+5. **Build skipped** if an image with the same tag already exists in ECR (idempotent)
+6. **`cdk.json` updated** with `ws_bridge_image_tag` for CDK to reference
+
+```bash
+# Build WS Bridge image only (without full deploy)
+./scripts/deploy.sh --ws-bridge-only
+```
+
+#### Infrastructure managed outside CDK
+
+The ECR repository and CodeBuild project are created by `deploy.sh` (not CDK), following the same pattern as the Starter Toolkit's ECR repo. CDK references the pre-built image via `ecr.Repository.from_repository_name()`.
+
+| Resource | Managed by | Name |
+|----------|-----------|------|
+| ECR repo | deploy.sh | `openclaw-ws-bridge` |
+| CodeBuild project | deploy.sh | `openclaw-ws-bridge-build` |
+| CodeBuild IAM role | deploy.sh | `openclaw-ws-bridge-codebuild-{region}` |
+| ECS Cluster/Service | CDK | `openclaw-ws-bridge` |
 
 Orphan cleanup handles both old `/openclaw/dingtalk-bridge` and new `/openclaw/ws-bridge` log groups.
 
