@@ -119,11 +119,63 @@ class DingTalkAdapter(ChannelAdapter):
                 msg = adapter._parse_message(data)
                 # Process in thread pool (boto3 calls are synchronous)
                 asyncio.get_event_loop().run_in_executor(
-                    None, adapter.core.process_message, adapter, msg)
+                    None, adapter._process_with_emotion, msg, data)
 
                 return AckMessage.STATUS_OK, "OK"
 
         return Handler()
+
+    def _process_with_emotion(self, msg: InboundMessage, raw_data: dict):
+        """Wrap process_message with emotion reply/recall (thinking indicator)."""
+        # Add 🤔思考中 emotion as instant acknowledgment
+        self._add_emotion_reply(raw_data)
+        try:
+            self.core.process_message(self, msg)
+        finally:
+            self._recall_emotion_reply(raw_data)
+
+    def _add_emotion_reply(self, data: dict):
+        """Add a '🤔思考中' emotion reply to acknowledge message receipt.
+
+        Following the official dingtalk-openclaw-connector pattern.
+        """
+        try:
+            headers = self._api_headers()
+            payload = json.dumps({
+                "robotCode": self.robot_code,
+                "openMsgId": data.get("msgId", ""),
+                "openConversationId": data.get("conversationId", ""),
+                "emotionType": 2,
+                "emotionName": "\U0001f914\u601d\u8003\u4e2d",
+                "textEmotion": {
+                    "emotionId": "2659900",
+                    "emotionName": "\U0001f914\u601d\u8003\u4e2d",
+                    "text": "\U0001f914\u601d\u8003\u4e2d",
+                    "backgroundId": "im_bg_1",
+                },
+            }).encode()
+            req = urllib_request.Request(
+                f"{DINGTALK_API}/v1.0/robot/emotion/reply",
+                data=payload, headers=headers)
+            urllib_request.urlopen(req, timeout=5)
+        except Exception as e:
+            logger.debug("bot=%s Failed to add emotion reply: %s", self.config.id, e)
+
+    def _recall_emotion_reply(self, data: dict):
+        """Remove the thinking emotion after processing is complete."""
+        try:
+            headers = self._api_headers()
+            payload = json.dumps({
+                "robotCode": self.robot_code,
+                "openMsgId": data.get("msgId", ""),
+                "openConversationId": data.get("conversationId", ""),
+            }).encode()
+            req = urllib_request.Request(
+                f"{DINGTALK_API}/v1.0/robot/emotion/recall",
+                data=payload, headers=headers)
+            urllib_request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # Best-effort removal
 
     def _parse_message(self, data: dict) -> InboundMessage:
         """Convert raw DingTalk callback data to InboundMessage."""

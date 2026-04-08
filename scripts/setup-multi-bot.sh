@@ -213,7 +213,7 @@ print('yes' if any(b['id'] == '$BOT_ID' for b in data.get('bots',[])) else 'no')
         echo "  Required permissions:"
         echo "    - im:message (Send messages)"
         echo "    - im:message.group_at_msg (Receive group @mentions)"
-        echo "    - im:resource (Download images/files)"
+        echo "    - im:resource (Upload/download images and files — required for native file sending)"
         echo ""
         echo "  Required events (Event Subscriptions > Add Event):"
         echo "    - im.message.receive_v1 (Receive messages)"

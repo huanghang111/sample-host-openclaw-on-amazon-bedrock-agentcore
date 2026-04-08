@@ -137,6 +137,63 @@ class FeishuAdapter(ChannelAdapter):
             logger.warning("bot=%s Failed to fetch bot info: %s", self.config.id, e)
 
     # ------------------------------------------------------------------
+    # Typing indicator (message reaction)
+    # ------------------------------------------------------------------
+
+    def _add_typing_reaction(self, message_id: str) -> str:
+        """Add a 'TYPING' emoji reaction to acknowledge message receipt.
+
+        Returns the reaction_id for later removal, or empty string on failure.
+        Following the official openclaw-lark plugin pattern.
+        """
+        if not self._lark_client or not message_id:
+            return ""
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            from lark_oapi.api.im.v1.model.emoji import Emoji
+            emoji = Emoji.builder().emoji_type("OnIt").build()
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(emoji)
+                .build()
+            )
+            req = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+            resp = self._lark_client.im.v1.message_reaction.create(req)
+            if resp.success() and resp.data:
+                reaction_id = resp.data.reaction_id or ""
+                return reaction_id
+            else:
+                logger.info("bot=%s Typing reaction failed: code=%s msg=%s",
+                            self.config.id, resp.code if resp else "?", resp.msg if resp else "?")
+        except Exception as e:
+            logger.info("bot=%s Failed to add typing reaction: %s", self.config.id, e)
+        return ""
+
+    def _remove_typing_reaction(self, message_id: str, reaction_id: str):
+        """Remove the typing reaction after processing is complete."""
+        if not self._lark_client or not message_id or not reaction_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            req = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            self._lark_client.im.v1.message_reaction.delete(req)
+        except Exception:
+            pass  # Best-effort removal
+
+    # ------------------------------------------------------------------
     # Message handler
     # ------------------------------------------------------------------
 
@@ -197,8 +254,16 @@ class FeishuAdapter(ChannelAdapter):
                          self.config.id, msg_type,
                          msg.sender_id[:20] if msg.sender_id else "?", is_group)
 
-            # Process synchronously in this thread (boto3 is sync)
-            self.core.process_message(self, msg)
+            # Add "Typing" reaction as instant acknowledgment
+            reaction_id = self._add_typing_reaction(message.message_id)
+
+            try:
+                # Process synchronously in this thread (boto3 is sync)
+                self.core.process_message(self, msg)
+            finally:
+                # Remove typing reaction after processing
+                if reaction_id:
+                    self._remove_typing_reaction(message.message_id, reaction_id)
 
         except Exception:
             logger.error("bot=%s Error handling Feishu message", self.config.id,
@@ -271,16 +336,31 @@ class FeishuAdapter(ChannelAdapter):
 
     def send_file(self, receiver_id, file_key, filename, file_type, *,
                   is_group=False, conversation_id=""):
-        """Send a file message. file_key should be a Feishu file_key from upload."""
+        """Send a file message using the correct msg_type per file type.
+
+        Following the official openclaw-lark plugin convention:
+        - audio (opus/ogg/mp3/wav): msg_type='audio'
+        - video (mp4/mov/avi): msg_type='media'
+        - other files: msg_type='file'
+        """
         if not self._lark_client:
             return
+
+        # Determine msg_type from file extension (matching official openclaw-lark)
+        ext = file_type.lower().lstrip(".")
+        if ext in ("opus", "ogg", "mp3", "wav"):
+            msg_type = "audio"
+        elif ext in ("mp4", "mov", "avi", "mkv", "webm"):
+            msg_type = "media"
+        else:
+            msg_type = "file"
 
         receive_id = conversation_id if is_group else receiver_id
         receive_id_type = "chat_id" if is_group else "open_id"
         body = (
             CreateMessageRequestBody.builder()
             .receive_id(receive_id)
-            .msg_type("file")
+            .msg_type(msg_type)
             .content(json.dumps({"file_key": file_key}))
             .build()
         )
@@ -293,8 +373,12 @@ class FeishuAdapter(ChannelAdapter):
         try:
             resp = self._lark_client.im.v1.message.create(req)
             if not resp.success():
-                logger.error("bot=%s Feishu send_file failed: code=%s msg=%s",
-                             self.config.id, resp.code, resp.msg)
+                logger.error("bot=%s Feishu send_file failed: code=%s msg=%s body=%s",
+                             self.config.id, resp.code, resp.msg,
+                             resp.raw.content.decode()[:500] if resp.raw else "")
+            else:
+                logger.info("bot=%s Sent %s via Feishu: %s (%s)",
+                            self.config.id, msg_type, filename, file_key[:20])
         except Exception as e:
             logger.error("bot=%s Feishu send_file error: %s", self.config.id, e)
 
@@ -367,8 +451,11 @@ class FeishuAdapter(ChannelAdapter):
                     logger.info("bot=%s Uploaded image to Feishu: image_key=%s",
                                 self.config.id, image_key)
                     return image_key
-                logger.error("bot=%s Feishu image upload failed: %s",
-                             self.config.id, resp.msg if resp else "no response")
+                logger.error("bot=%s Feishu image upload failed: code=%s msg=%s body=%s",
+                             self.config.id,
+                             resp.code if resp else "?",
+                             resp.msg if resp else "no response",
+                             resp.raw.content.decode()[:500] if resp and resp.raw else "")
             else:
                 from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
                 import io
@@ -399,13 +486,17 @@ class FeishuAdapter(ChannelAdapter):
                 resp = self._lark_client.im.v1.file.create(req)
                 if resp.success() and resp.data:
                     file_key = resp.data.file_key
-                    logger.info("bot=%s Uploaded file to Feishu: file_key=%s",
-                                self.config.id, file_key)
+                    logger.info("bot=%s Uploaded file to Feishu: file_key=%s type=%s",
+                                self.config.id, file_key, feishu_file_type)
                     return file_key
-                logger.error("bot=%s Feishu file upload failed: %s",
-                             self.config.id, resp.msg if resp else "no response")
+                logger.error("bot=%s Feishu file upload failed: code=%s msg=%s body=%s",
+                             self.config.id,
+                             resp.code if resp else "?",
+                             resp.msg if resp else "no response",
+                             resp.raw.content.decode()[:500] if resp and resp.raw else "")
         except Exception as e:
-            logger.error("bot=%s Feishu media upload failed: %s", self.config.id, e)
+            logger.error("bot=%s Feishu media upload failed: %s", self.config.id, e,
+                         exc_info=True)
         return None
 
     def download_media(self, download_code, max_bytes, *, message_id=""):

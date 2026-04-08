@@ -14,7 +14,7 @@ from aws_cdk import (
     RemovalPolicy,
     Stack,
     aws_ec2 as ec2,
-    aws_ecr_assets as ecr_assets,
+    aws_ecr as ecr,
     aws_ecs as ecs,
     aws_iam as iam,
     aws_logs as logs,
@@ -115,12 +115,19 @@ class WsBridgeStack(Stack):
             ),
         )
 
+        # --- Container image from ECR (built by deploy.sh via CodeBuild) ---
+        ws_bridge_repo = ecr.Repository.from_repository_name(
+            self, "WsBridgeRepo", "openclaw-ws-bridge",
+        )
+        ws_bridge_image_tag = str(
+            self.node.try_get_context("ws_bridge_image_tag") or "latest"
+        )
+
         # --- Container ---
         container = task_def.add_container(
             "WsBridgeContainer",
-            image=ecs.ContainerImage.from_asset(
-                "ws-bridge",
-                platform=ecr_assets.Platform.LINUX_ARM64,
+            image=ecs.ContainerImage.from_ecr_repository(
+                ws_bridge_repo, tag=ws_bridge_image_tag,
             ),
             logging=ecs.LogDrivers.aws_logs(
                 stream_prefix="ws-bridge",

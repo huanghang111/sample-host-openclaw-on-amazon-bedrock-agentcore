@@ -345,17 +345,18 @@ Implemented in `core/shared.py:SharedCore.process_message()`:
 
 ### 4.5 DingTalk Adapter
 
-File: `adapters/dingtalk.py` (~280 lines)
+File: `adapters/dingtalk.py` (~330 lines)
 
 - Per-bot access token cache (`_token_cache` dict)
 - `_make_handler()` creates a `dingtalk_stream.ChatbotHandler` subclass that converts raw callback data to `InboundMessage` and dispatches to `core.process_message` via thread pool
 - `_send_robot_message()` generic sender — all send methods (text, image, file, link) delegate to it with different `msgKey` / `msgParam`
 - `download_media()` — two-step: DingTalk API → OSS download URL → fetch bytes, with HTTP→HTTPS upgrade
 - Message text extraction handles `text`, `richText`, `picture`, `file`, `video` message types
+- **Typing indicator**: `_add_emotion_reply()` sends a 🤔思考中 emotion via `POST /v1.0/robot/emotion/reply` on message receipt; `_recall_emotion_reply()` removes it via `/emotion/recall` after response. Following the official dingtalk-openclaw-connector pattern
 
 ### 4.6 Feishu Adapter
 
-File: `adapters/feishu.py` (~340 lines)
+File: `adapters/feishu.py` (~410 lines)
 
 - **Two clients**: `lark.Client` for HTTP API calls (send, download), `lark.ws.Client` for WebSocket events
 - **`lark.Client.builder()`** takes no args — chain `.app_id(x).app_secret(y).domain(url).build()`
@@ -367,6 +368,8 @@ File: `adapters/feishu.py` (~340 lines)
 - `send_link` uses `post` (rich text) message type with `[{tag:"a", href:url}]`
 - `upload_media` — images via `/im/v1/images`, files via `/im/v1/files` with auto-detected Feishu file type
 - `download_media` — `GetMessageResourceRequest` with `message_id` + `file_key`
+- **Typing indicator**: `_add_typing_reaction()` adds an `OnIt` emoji reaction via `im.v1.message_reaction.create()` on message receipt; `_remove_typing_reaction()` removes it after response. Following the official openclaw-lark plugin pattern. Requires `im:message:reaction` permission on the Feishu app
+- `send_file` uses correct `msg_type` per file type: `audio` for opus/ogg/mp3, `media` for mp4/mov, `file` for everything else (matching the official openclaw-lark plugin)
 
 **lark-oapi gotchas (learned the hard way):**
 - `lark.ws.Client` has NO builder pattern — use constructor directly
@@ -374,6 +377,8 @@ File: `adapters/feishu.py` (~340 lines)
 - No `lark_oapi.api.bot` module exists — use HTTP API for bot info
 - Module-level `loop` in `lark_oapi.ws.client` — must patch before constructing `ws.Client` (ExpiringCache.__init__ calls `loop.create_task()`)
 - `ws.Client.start()` calls `loop.run_until_complete()` — fails with "This event loop is already running" if another coroutine is driving the loop
+- Message reaction `reaction_type` requires an `Emoji` object (not a dict): `Emoji.builder().emoji_type("OnIt").build()`. Valid emoji types: `OnIt`, `THUMBSUP`, `DONE`, `OK`, `THINKING`, etc. — see https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
+- Reaction API requires `im:message:reaction` permission on the Feishu app. Without it, reactions silently fail with code 231001
 
 ---
 
@@ -389,7 +394,7 @@ File: `stacks/ws_bridge_stack.py` — replaces `stacks/dingtalk_stack.py` (legac
 | ECS Cluster | `openclaw-ws-bridge` |
 | Service | `openclaw-ws-bridge` |
 | Log group | `/openclaw/ws-bridge` |
-| Docker context | `ws-bridge/` |
+| ECR repo | `openclaw-ws-bridge` (created by deploy.sh) |
 | Task def | ARM64, 256 CPU / 512 MB (configurable) |
 
 **Opt-in** via `ws_bridge_enabled: true` in `cdk.json`. When disabled, no ECS resources are created.
@@ -431,13 +436,41 @@ Same as the old DingTalk bridge — both channels need identical AWS access:
 
 ### 5.5 Deploy Script
 
-`scripts/deploy.sh` deploys the WS Bridge in **Phase 3** (dependent stacks):
+`scripts/deploy.sh` deploys the WS Bridge image via **CodeBuild** (no local Docker required), then deploys the ECS service via CDK in Phase 3:
 
 ```
 Phase 1: OpenClawVpc, OpenClawSecurity, OpenClawGuardrails, OpenClawAgentCore, OpenClawObservability
-Phase 2: Starter Toolkit (Runtime, ECR, Docker build)
+Phase 2: Starter Toolkit (Runtime, ECR, Docker build for main bridge)
+WS Bridge image build (CodeBuild, ARM64) ← runs before Phase 3
 Phase 3: OpenClawRouter, OpenClawCron, OpenClawWsBridge, OpenClawTokenMonitoring
 ```
+
+#### WS Bridge Image Build Flow
+
+The image build is fully automated by `deploy.sh` and uses **AWS CodeBuild** with ARM64 compute — no local Docker installation needed:
+
+1. **ECR repository** `openclaw-ws-bridge` created if not exists
+2. **CodeBuild project** `openclaw-ws-bridge-build` created if not exists (with IAM role for ECR push, S3 source read, CloudWatch Logs)
+3. **Source zip** of `ws-bridge/` uploaded to S3 (`_build/ws-bridge-source.zip`)
+4. **Content-based image tag** computed from source hash (`build-{hash}`) — CDK detects tag changes and redeploys ECS automatically
+5. **Build skipped** if an image with the same tag already exists in ECR (idempotent)
+6. **`cdk.json` updated** with `ws_bridge_image_tag` for CDK to reference
+
+```bash
+# Build WS Bridge image only (without full deploy)
+./scripts/deploy.sh --ws-bridge-only
+```
+
+#### Infrastructure managed outside CDK
+
+The ECR repository and CodeBuild project are created by `deploy.sh` (not CDK), following the same pattern as the Starter Toolkit's ECR repo. CDK references the pre-built image via `ecr.Repository.from_repository_name()`.
+
+| Resource | Managed by | Name |
+|----------|-----------|------|
+| ECR repo | deploy.sh | `openclaw-ws-bridge` |
+| CodeBuild project | deploy.sh | `openclaw-ws-bridge-build` |
+| CodeBuild IAM role | deploy.sh | `openclaw-ws-bridge-codebuild-{region}` |
+| ECS Cluster/Service | CDK | `openclaw-ws-bridge` |
 
 Orphan cleanup handles both old `/openclaw/dingtalk-bridge` and new `/openclaw/ws-bridge` log groups.
 

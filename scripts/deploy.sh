@@ -12,11 +12,12 @@
 #   ./scripts/deploy.sh --runtime-only   # toolkit deploy only (Phase 2)
 #   ./scripts/deploy.sh --phase1         # Phase 1 only
 #   ./scripts/deploy.sh --phase3         # Phase 3 only (assumes runtime already deployed)
+#   ./scripts/deploy.sh --ws-bridge-only # build WS Bridge image only (via CodeBuild)
 #
 # Environment variables:
-#   BUILD_MODE          local-build (default) or codebuild
-#                       local-build: builds ARM64 container locally with Docker (recommended)
-#                       codebuild: builds in AWS CodeBuild (no Docker required, adds cost)
+#   BUILD_MODE          codebuild (default) or local-build
+#                       codebuild: builds in AWS CodeBuild (no local Docker required)
+#                       local-build: builds ARM64 container locally with Docker
 #   CDK_DEFAULT_ACCOUNT AWS account ID (auto-detected if not set)
 #   CDK_DEFAULT_REGION  AWS region (falls back to cdk.json, then aws configure)
 #   AGENTCORE_CLI       Path to agentcore CLI (auto-detected)
@@ -27,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- Build mode ---
-BUILD_MODE="${BUILD_MODE:-local-build}"
+BUILD_MODE="${BUILD_MODE:-codebuild}"
 
 # --- Pre-flight checks ---
 preflight() {
@@ -51,20 +52,20 @@ preflight() {
     errors=$((errors + 1))
   fi
 
-  # Docker (only for local-build)
+  # Docker (only for local-build mode)
   if [ "$BUILD_MODE" = "local-build" ]; then
     if ! command -v docker &>/dev/null; then
-      echo "ERROR: Docker not found (required for BUILD_MODE=local-build). Install Docker or set BUILD_MODE=codebuild."
+      echo "ERROR: Docker not found (required for BUILD_MODE=local-build). Install Docker or use default BUILD_MODE=codebuild."
       errors=$((errors + 1))
     elif ! docker info &>/dev/null 2>&1; then
-      echo "ERROR: Docker daemon not running. Start Docker or set BUILD_MODE=codebuild."
+      echo "ERROR: Docker daemon not running. Start Docker or use default BUILD_MODE=codebuild."
       errors=$((errors + 1))
     fi
   fi
 
   # Agentcore CLI
   if ! command -v "${AGENTCORE_CLI:-agentcore}" &>/dev/null && [ ! -x "$HOME/.local/bin/agentcore" ]; then
-    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-cli"
+    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-starter-toolkit==0.3.3"
     errors=$((errors + 1))
   fi
 
@@ -432,7 +433,7 @@ phase2_toolkit() {
     if command -v agentcore &>/dev/null; then
       AGENTCORE_CLI="agentcore"
     else
-      echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-starter-toolkit"
+      echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-starter-toolkit==0.3.3"
       exit 1
     fi
   fi
@@ -581,6 +582,233 @@ with open('$PROJECT_DIR/cdk.json', 'w') as f:
   echo ""
 }
 
+# --- Build WS Bridge container image via CodeBuild ---
+build_ws_bridge_image() {
+  local WS_ENABLED
+  WS_ENABLED=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('ws_bridge_enabled', False)).lower())")
+  if [ "$WS_ENABLED" != "true" ]; then
+    echo "--- WS Bridge disabled, skipping image build ---"
+    return 0
+  fi
+
+  echo "=== Building WS Bridge image via CodeBuild ==="
+  cd "$PROJECT_DIR"
+  activate_venv
+
+  local ECR_REPO="openclaw-ws-bridge"
+  local ECR_URI="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}"
+  local CB_PROJECT="openclaw-ws-bridge-build"
+  local CB_ROLE_NAME="openclaw-ws-bridge-codebuild-${REGION}"
+  local CB_ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/${CB_ROLE_NAME}"
+  local S3_BUCKET="openclaw-user-files-${ACCOUNT}-${REGION}"
+  local S3_SOURCE_KEY="_build/ws-bridge-source.zip"
+
+  # Read CMK ARN (S3 bucket is KMS-encrypted)
+  local CMK_ARN
+  CMK_ARN=$(aws cloudformation describe-stacks --stack-name OpenClawSecurity --region "$REGION" \
+    --query "Stacks[0].Outputs[?contains(OutputKey,'SecretsCmk')].OutputValue" --output text 2>/dev/null || true)
+
+  # 1. Create ECR repo if not exists
+  if ! aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$REGION" &>/dev/null; then
+    echo "  Creating ECR repository: $ECR_REPO"
+    aws ecr create-repository \
+      --repository-name "$ECR_REPO" \
+      --region "$REGION" \
+      --image-scanning-configuration scanOnPush=true > /dev/null
+  fi
+
+  # 2. Create CodeBuild service role if not exists
+  if ! aws iam get-role --role-name "$CB_ROLE_NAME" &>/dev/null 2>&1; then
+    echo "  Creating CodeBuild service role: $CB_ROLE_NAME"
+    aws iam create-role \
+      --role-name "$CB_ROLE_NAME" \
+      --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Service": "codebuild.amazonaws.com"},
+          "Action": "sts:AssumeRole"
+        }]
+      }' > /dev/null
+
+    # Build the KMS statement only if CMK_ARN is available
+    local KMS_STATEMENT=""
+    if [ -n "$CMK_ARN" ]; then
+      KMS_STATEMENT=",{
+            \"Effect\": \"Allow\",
+            \"Action\": [\"kms:Decrypt\", \"kms:GenerateDataKey\"],
+            \"Resource\": \"${CMK_ARN}\"
+          }"
+    fi
+
+    aws iam put-role-policy \
+      --role-name "$CB_ROLE_NAME" \
+      --policy-name "ws-bridge-build" \
+      --policy-document "{
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [
+          {
+            \"Effect\": \"Allow\",
+            \"Action\": [\"ecr:GetAuthorizationToken\"],
+            \"Resource\": \"*\"
+          },
+          {
+            \"Effect\": \"Allow\",
+            \"Action\": [
+              \"ecr:BatchCheckLayerAvailability\",
+              \"ecr:GetDownloadUrlForLayer\",
+              \"ecr:BatchGetImage\",
+              \"ecr:PutImage\",
+              \"ecr:InitiateLayerUpload\",
+              \"ecr:UploadLayerPart\",
+              \"ecr:CompleteLayerUpload\"
+            ],
+            \"Resource\": \"arn:aws:ecr:${REGION}:${ACCOUNT}:repository/${ECR_REPO}\"
+          },
+          {
+            \"Effect\": \"Allow\",
+            \"Action\": [\"s3:GetObject\", \"s3:GetBucketLocation\"],
+            \"Resource\": [
+              \"arn:aws:s3:::${S3_BUCKET}\",
+              \"arn:aws:s3:::${S3_BUCKET}/${S3_SOURCE_KEY}\"
+            ]
+          },
+          {
+            \"Effect\": \"Allow\",
+            \"Action\": [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"],
+            \"Resource\": \"arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${CB_PROJECT}:*\"
+          }${KMS_STATEMENT}
+        ]
+      }"
+
+    echo "  Waiting for IAM role propagation..."
+    sleep 10
+  fi
+
+  # 3. Create CodeBuild project if not exists
+  local EXISTING_PROJECT
+  EXISTING_PROJECT=$(aws codebuild batch-get-projects --names "$CB_PROJECT" --region "$REGION" \
+    --query "projects[0].name" --output text 2>/dev/null || echo "")
+  if [ "$EXISTING_PROJECT" != "$CB_PROJECT" ]; then
+    echo "  Creating CodeBuild project: $CB_PROJECT"
+    aws codebuild create-project \
+      --name "$CB_PROJECT" \
+      --region "$REGION" \
+      --source "{
+        \"type\": \"S3\",
+        \"location\": \"${S3_BUCKET}/${S3_SOURCE_KEY}\"
+      }" \
+      --environment "{
+        \"type\": \"ARM_CONTAINER\",
+        \"image\": \"aws/codebuild/amazonlinux-aarch64-standard:3.0\",
+        \"computeType\": \"BUILD_GENERAL1_SMALL\",
+        \"privilegedMode\": true,
+        \"environmentVariables\": [
+          {\"name\": \"ECR_URI\", \"value\": \"${ECR_URI}\"},
+          {\"name\": \"IMAGE_TAG\", \"value\": \"latest\"}
+        ]
+      }" \
+      --artifacts '{"type": "NO_ARTIFACTS"}' \
+      --service-role "$CB_ROLE_ARN" > /dev/null
+  fi
+
+  # 4. Zip ws-bridge/ source and upload to S3
+  echo "  Packaging ws-bridge source..."
+  local TMPZIP
+  TMPZIP=$(mktemp /tmp/ws-bridge-source-XXXXX.zip)
+  python3 -c "
+import zipfile, os
+with zipfile.ZipFile('$TMPZIP', 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk('$PROJECT_DIR/ws-bridge'):
+        dirs[:] = [d for d in dirs if d not in ('__pycache__', '.pytest_cache', '*.egg-info')]
+        for f in files:
+            if not f.endswith('.pyc'):
+                filepath = os.path.join(root, f)
+                arcname = os.path.relpath(filepath, '$PROJECT_DIR/ws-bridge')
+                z.write(filepath, arcname)
+"
+
+  # Compute content-based image tag for CDK change detection
+  local IMAGE_TAG
+  IMAGE_TAG="build-$(sha256sum "$TMPZIP" | cut -c1-8)"
+
+  # Check if this exact image already exists in ECR — skip build if so
+  if aws ecr describe-images --repository-name "$ECR_REPO" --image-ids "imageTag=$IMAGE_TAG" \
+       --region "$REGION" &>/dev/null; then
+    echo "  Image $ECR_URI:$IMAGE_TAG already exists, skipping build."
+    rm -f "$TMPZIP"
+  else
+    echo "  Uploading source to s3://${S3_BUCKET}/${S3_SOURCE_KEY}..."
+    aws s3 cp "$TMPZIP" "s3://${S3_BUCKET}/${S3_SOURCE_KEY}" --region "$REGION" > /dev/null
+    rm -f "$TMPZIP"
+
+    # 5. Start CodeBuild
+    echo "  Starting CodeBuild (ARM64)..."
+    local BUILD_ID
+    BUILD_ID=$(aws codebuild start-build \
+      --project-name "$CB_PROJECT" \
+      --region "$REGION" \
+      --buildspec-override "$(cat <<'BUILDSPEC'
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - REGISTRY=$(echo $ECR_URI | cut -d/ -f1)
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REGISTRY
+  build:
+    commands:
+      - docker build --platform linux/arm64 -t $ECR_URI:$IMAGE_TAG .
+      - docker tag $ECR_URI:$IMAGE_TAG $ECR_URI:latest
+  post_build:
+    commands:
+      - docker push $ECR_URI:$IMAGE_TAG
+      - docker push $ECR_URI:latest
+BUILDSPEC
+)" \
+      --environment-variables-override "[
+        {\"name\":\"ECR_URI\",\"value\":\"${ECR_URI}\",\"type\":\"PLAINTEXT\"},
+        {\"name\":\"IMAGE_TAG\",\"value\":\"${IMAGE_TAG}\",\"type\":\"PLAINTEXT\"}
+      ]" \
+      --query 'build.id' --output text)
+    echo "  Build ID: $BUILD_ID"
+
+    # 6. Wait for build completion
+    echo "  Waiting for CodeBuild to finish..."
+    local STATUS=""
+    while true; do
+      STATUS=$(aws codebuild batch-get-builds --ids "$BUILD_ID" --region "$REGION" \
+        --query 'builds[0].buildStatus' --output text)
+      case "$STATUS" in
+        SUCCEEDED)
+          echo "  Build succeeded."
+          break
+          ;;
+        FAILED|FAULT|TIMED_OUT|STOPPED)
+          echo "  ERROR: Build $STATUS. Check logs: /aws/codebuild/$CB_PROJECT"
+          exit 1
+          ;;
+        *)
+          sleep 15
+          ;;
+      esac
+    done
+  fi
+
+  # 7. Update cdk.json with image tag for CDK change detection
+  python3 -c "
+import json
+with open('$PROJECT_DIR/cdk.json') as f:
+    cfg = json.load(f)
+cfg['context']['ws_bridge_image_tag'] = '$IMAGE_TAG'
+with open('$PROJECT_DIR/cdk.json', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+"
+  echo "  Image: $ECR_URI:$IMAGE_TAG"
+  echo "  WS Bridge image build complete."
+  echo ""
+}
+
 # --- Phase 3: CDK dependent stacks ---
 phase3_cdk() {
   echo "=== Phase 3: CDK dependent stacks ==="
@@ -614,16 +842,22 @@ case "$MODE" in
   --runtime-only)
     phase2_toolkit
     ;;
+  --ws-bridge-only)
+    build_ws_bridge_image
+    ;;
   --phase3)
+    build_ws_bridge_image
     phase3_cdk
     ;;
   --cdk-only)
     phase1_cdk
+    build_ws_bridge_image
     phase3_cdk
     ;;
   *)
     phase1_cdk
     phase2_toolkit
+    build_ws_bridge_image
     phase3_cdk
     ;;
 esac
