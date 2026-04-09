@@ -6,7 +6,7 @@
 
 > **实验性项目** — 仅供学习和实验使用，**不适用于生产环境**。架构和配置可能随时变更。
 
-在 AWS Bedrock AgentCore Runtime 上部署多渠道 AI 聊天机器人（钉钉、飞书），使用 CDK 管理基础设施。通过 WebSocket 多机器人桥接服务接入钉钉和飞书，每个用户拥有独立的 AgentCore 容器。
+在 AWS Bedrock AgentCore Runtime 上部署多渠道 AI 聊天机器人（钉钉、飞书、Telegram、Slack），使用 CDK 管理基础设施。通过 WebSocket 多机器人桥接服务接入钉钉和飞书，Webhook 方式接入 Telegram 和 Slack。每个用户拥有独立的 AgentCore 容器。内置 Web 管理控制台，支持渠道配置、用户管理、文件浏览和技能安全扫描。
 
 ---
 
@@ -17,6 +17,8 @@ flowchart LR
     subgraph 渠道
         DT[钉钉]
         FS[飞书]
+        TG[Telegram]
+        SK[Slack]
     end
 
     subgraph AWS
@@ -26,15 +28,24 @@ flowchart LR
         CRON[EventBridge Scheduler]
         CRONLAMBDA[Cron Lambda]
         WSBRIDGE[WS Bridge<br/>ECS Fargate]
+        ROUTER[Router Lambda<br/>API Gateway]
+        ADMIN[Admin Console<br/>CloudFront + S3]
     end
 
     DT & FS <-->|WebSocket| WSBRIDGE
+    TG & SK <-->|Webhook| ROUTER
     WSBRIDGE <-->|用户/会话| DDB
-    WSBRIDGE <--> AGENT <--> BEDROCK
+    ROUTER <-->|用户/会话| DDB
+    WSBRIDGE & ROUTER <--> AGENT <--> BEDROCK
     CRON --> CRONLAMBDA <--> AGENT
+    ADMIN -->|管理 API| DDB
 ```
 
-**工作原理**：钉钉和飞书通过 WebSocket 连接到 WS Bridge（ECS Fargate），Bridge 解析用户身份后路由到每用户独立的 AgentCore 容器。每个用户拥有隔离的计算环境、持久化工作空间和大模型访问权限。
+**工作原理**：
+- **钉钉/飞书**：通过 WebSocket 连接到 WS Bridge（ECS Fargate）
+- **Telegram/Slack**：通过 Webhook 连接到 Router Lambda（API Gateway）
+- 所有渠道统一解析用户身份后路由到每用户独立的 AgentCore 容器
+- **Admin Console**：Web 管理界面，管理渠道配置、用户白名单、文件浏览等
 
 ### 核心特性
 
@@ -49,6 +60,7 @@ flowchart LR
 - **API 密钥管理** — 双模式存储（本地文件 / AWS Secrets Manager）
 - **STS 会话凭证** — 每用户 S3 命名空间隔离，防止跨用户数据访问
 - **社区技能** — 5 个预装 ClawHub 技能（jina-reader、deep-research-pro 等）
+- **Admin Console** — Web 管理控制台（渠道配置、用户/白名单管理、文件浏览、技能安全扫描）
 
 ---
 
@@ -121,7 +133,7 @@ cdk synth          # 验证 + cdk-nag 安全检查
 |------|------|------|
 | Phase 1 | CDK 基础设施（VPC、安全、AgentCore、监控） | ~5 分钟 |
 | Phase 2 | Starter Toolkit（Runtime、ECR、Docker 镜像） | ~10 分钟 |
-| Phase 3 | CDK 依赖栈（Cron、**WS Bridge**、Token 监控） | ~5 分钟 |
+| Phase 3 | CDK 依赖栈（Cron、WS Bridge、**Admin Console**、Token 监控） | ~5 分钟 |
 
 #### 构建模式
 
@@ -139,7 +151,22 @@ cdk synth          # 验证 + cdk-nag 安全检查
 ./scripts/deploy.sh --cdk-only       # 跳过 Starter Toolkit
 ```
 
-### 6. 配置钉钉/飞书机器人
+### 6. 部署 Admin Console（可选）
+
+```bash
+# 部署 Admin 后端（CDK stack，已包含在 Phase 3 中）
+cdk deploy OpenClawAdmin --require-approval never
+
+# 构建并部署前端
+./scripts/deploy-admin-ui.sh
+
+# 创建管理员账号
+./scripts/setup-admin.sh your-email@example.com
+```
+
+首次登录使用临时密码，登录后需修改密码。详见 [Admin Console 使用说明](#admin-console)。
+
+### 7. 配置钉钉/飞书机器人
 
 ```bash
 ./scripts/setup-multi-bot.sh
@@ -153,7 +180,7 @@ cdk synth          # 验证 + cdk-nag 安全检查
 
 详细配置步骤（钉钉开放平台、飞书开发者控制台设置等）参见 [部署手册](docs/部署手册.md)。
 
-### 7. 验证
+### 8. 验证
 
 向钉钉或飞书机器人发送消息。首次消息触发冷启动（约 1-2 分钟），期间会立即显示表情反应（钉钉🤔思考中 / 飞书 OnIt）作为视觉反馈。OpenClaw 就绪后即可使用全部功能。后续消息响应很快。
 
@@ -253,7 +280,9 @@ WS Bridge 采用混合线程模型：
 | **OpenClawVpc** | VPC、子网、NAT、7 个 VPC 端点 | 无 |
 | **OpenClawSecurity** | KMS CMK、Secrets Manager、Cognito | 无 |
 | **OpenClawAgentCore** | Runtime、ECR、S3、IAM | Vpc, Security |
+| **OpenClawRouter** | Router Lambda、API Gateway（Telegram/Slack Webhook） | AgentCore, Security |
 | **OpenClawWsBridge** | ECS Fargate、ECR、CloudWatch（钉钉/飞书多机器人） | Vpc, Security, AgentCore |
+| **OpenClawAdmin** | Cognito、API Gateway、Lambda、CloudFront、S3（管理控制台） | Router, Security |
 | **OpenClawCron** | EventBridge Scheduler、Cron Lambda | AgentCore, Security |
 | **OpenClawObservability** | CloudWatch 仪表盘、告警、Bedrock 日志 | 无 |
 | **OpenClawTokenMonitoring** | DynamoDB、Lambda、分析仪表盘 | Observability |
@@ -350,6 +379,51 @@ cd bridge && node --test workspace-sync.test.js
 # E2E 测试（需要已部署的栈）
 pytest tests/e2e/bot_test.py -v
 ```
+
+---
+
+## Admin Console
+
+Web 管理控制台，替代 CLI 脚本进行日常管理操作。
+
+### 功能
+
+| 页面 | 功能 |
+|------|------|
+| **Dashboard** | 用户总数、白名单数、渠道分布、渠道配置状态 |
+| **Channels** | 配置 Telegram/Slack/Feishu/DingTalk 凭证、注册 Webhook、管理 Multi-Bot Bridge |
+| **Users** | 查看/删除用户、管理渠道绑定、管理白名单 |
+| **Files** | 按用户浏览 S3 文件、查看文本文件内容、删除文件、触发技能安全扫描 |
+
+### 部署
+
+```bash
+# 1. 部署 CDK stack（Cognito + API Gateway + Lambda + CloudFront）
+cdk deploy OpenClawAdmin --require-approval never
+
+# 2. 构建前端并部署到 S3 + CloudFront
+./scripts/deploy-admin-ui.sh
+
+# 3. 创建管理员账号
+./scripts/setup-admin.sh admin@example.com
+```
+
+### Multi-Bot 管理
+
+Channels 页面下方的 **Multi-Bot Bridge** 区域可以管理 WS Bridge 中的钉钉和飞书机器人：
+
+- 查看所有已配置的 bot 列表（ID、渠道类型、状态）
+- 添加新 bot（DingTalk 或 Feishu，输入凭证）
+- 启用/禁用 bot
+- 删除 bot
+
+> 修改 bot 配置后需要重启 ECS 服务才能生效：`./scripts/setup-multi-bot.sh restart`
+
+### 技术架构
+
+- **前端**：React + Vite + Ant Design SPA → S3 + CloudFront
+- **后端**：Python Lambda（单函数，路径路由）→ API Gateway HTTP API + Cognito JWT Authorizer
+- **认证**：独立 Cognito User Pool（`openclaw-admin-pool`），支持邮箱登录、强制改密、可选 MFA
 
 ---
 

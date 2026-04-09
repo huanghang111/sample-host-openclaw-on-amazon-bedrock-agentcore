@@ -25,6 +25,7 @@ from stacks.cron_stack import CronStack
 from stacks.ws_bridge_stack import WsBridgeStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
+from stacks.admin_stack import AdminStack
 
 app = cdk.App()
 
@@ -128,6 +129,26 @@ if _ws_bridge_enabled:
         user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
         env=env,
     )
+
+# --- Admin Control Plane (Cognito + API Gateway + Lambda + CloudFront) ---
+_s3_user_files_bucket_name = f"openclaw-user-files-{_account}-{_region}"
+
+admin_stack = AdminStack(
+    app,
+    "OpenClawAdmin",
+    identity_table_name=_identity_table_name,
+    identity_table_arn=_identity_table_arn,
+    s3_user_files_bucket_name=_s3_user_files_bucket_name,
+    cmk_arn=security_stack.cmk.key_arn,
+    router_api_url=router_stack.http_api.url or "",
+    telegram_secret_name=security_stack.channel_secrets["telegram"].secret_name,
+    slack_secret_name=security_stack.channel_secrets["slack"].secret_name,
+    feishu_secret_name=security_stack.channel_secrets["feishu"].secret_name,
+    dingtalk_secret_name=security_stack.channel_secrets["dingtalk"].secret_name,
+    webhook_secret_name=security_stack.webhook_secret.secret_name,
+    ws_bridge_bots_secret_name=security_stack.ws_bridge_bots_secret.secret_name,
+    env=env,
+)
 
 # --- Observability (dashboards + alarms) ---
 observability_stack = ObservabilityStack(
