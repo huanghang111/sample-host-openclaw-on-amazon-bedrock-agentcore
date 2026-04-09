@@ -57,8 +57,7 @@ flowchart TB
 
 | Component | Port | Purpose |
 |---|---|---|
-| **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`), lazy initialization, routing (shim vs WebSocket bridge) |
-| **Lightweight Agent** | — | Warm-up shim during cold start; agentic loop with 13 tools via proxy → Bedrock (see below) |
+| **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`), lazy initialization, waits for OpenClaw then routes via WebSocket bridge |
 | **Bedrock Proxy** | 18790 | OpenAI-compatible API → Bedrock ConverseStream, Cognito identity, multimodal image handling |
 | **OpenClaw Gateway** | 18789 | Headless AI agent with full tools and ClawHub skills (available after ~1-2 min startup) |
 
@@ -99,15 +98,13 @@ sequenceDiagram
         AC->>AC: Start OpenClaw with scoped creds (background, ~1-2 min)
     end
 
-    alt Warm-up phase (OpenClaw not ready)
-        Note over AC,B: Lightweight agent shim handles message
-        AC->>B: ConverseStream (via proxy)
-        B-->>AC: Response + warm-up footer
-    else Full mode (OpenClaw ready)
-        Note over AC,B: WebSocket bridge to OpenClaw
-        AC->>B: ConverseStream (via OpenClaw → proxy)
-        B-->>AC: Response (no footer)
+    alt Cold start (OpenClaw not ready yet)
+        Note over AC: Message blocks until OpenClaw ready (~1-2 min)
+        Note over C: Typing indicator / emoji reaction shown to user
     end
+    Note over AC,B: WebSocket bridge to OpenClaw
+    AC->>B: ConverseStream (via OpenClaw → proxy)
+    B-->>AC: Response
 
     AC-->>RL: Final response
     Note over RL: Unwrap nested content blocks<br/>Convert markdown → Telegram HTML
@@ -167,20 +164,12 @@ flowchart TB
     subgraph MicroVM["AgentCore MicroVM (ARM64, per-user)"]
         CONTRACT["<b>Contract Server :8080</b><br/>GET /ping → Healthy<br/>POST /invocations<br/>Lazy init · SIGTERM save"]
 
-        CONTRACT -->|"warm-up<br/>(OpenClaw not ready)"| SHIM
-        CONTRACT -->|"full mode<br/>(OpenClaw ready)"| OPENCLAW
+        CONTRACT -->|"waits for ready<br/>then routes"| OPENCLAW
 
-        subgraph ShimBox["Warm-up Phase (~5s – ~1-2min)"]
-            SHIM["<b>Lightweight Agent</b><br/>Agentic loop (20 iters)<br/>17 tools · SSRF protection<br/>Appends warm-up footer"]
-        end
-
-        subgraph FullBox["Full Mode (~1-2min onward)"]
-            OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>5 ClawHub skills · Sub-agents"]
-        end
+        OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>5 ClawHub skills · Sub-agents"]
 
         PROXY["<b>Bedrock Proxy :18790</b><br/>OpenAI compat → ConverseStream<br/>Cognito identity · Multimodal images"]
 
-        SHIM -->|"POST /v1/chat/completions<br/>(non-streaming)"| PROXY
         OPENCLAW <-->|WebSocket| PROXY
     end
 
@@ -188,7 +177,6 @@ flowchart TB
 
     S3[("S3<br/>workspace · files · images")]
     CONTRACT <-->|"restore / save<br/>.openclaw/"| S3
-    SHIM -.->|"execFile<br/>skill scripts"| S3
 ```
 
 ### Lightweight Agent Tools
@@ -251,38 +239,24 @@ gantt
     section Container
     MicroVM created                     :done, t0, 0, 1s
 
-    section Warm-up Phase
+    section Initialization
     Proxy starts (~5s)                  :active, t1, 1s, 5s
-    Lightweight agent handles messages  :active, t2, 5s, 90s
-
-    section Background
     OpenClaw starting (~1-2 min)        :crit, t3, 5s, 90s
     Workspace restore from S3           :done, t4, 1s, 10s
 
-    section Full Mode
-    OpenClaw ready — handoff            :milestone, m1, 90s, 0
+    section Cold Start Wait
+    Message blocks (typing indicator)   :active, t2, 5s, 90s
+
+    section Ready
+    OpenClaw ready                      :milestone, m1, 90s, 0
     Full runtime handles messages       :t5, 90s, 140s
 ```
 
-**Warm-up phase** (t=~5s to ~1-2min): Lightweight agent responds with 13 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management). All responses include `"_Warm-up mode — after full startup..._"` footer.
+**Cold start wait** (t=~5s to ~1-2min): Chat messages block until OpenClaw is ready. Channel-side typing indicators (emoji reactions for DingTalk/Feishu, typing animation for Telegram) provide instant visual feedback to the user.
 
-**Full mode** (t=~1-2min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
+**Ready** (t=~1-2min onward): OpenClaw gateway handles all messages via WebSocket bridge. Full features including ClawHub skills (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
 
-### Lightweight Agent Architecture
-
-The lightweight agent (`bridge/lightweight-agent.js`) provides immediate responsiveness during the ~1-2 minute OpenClaw cold start. It is NOT a replacement for OpenClaw — it's a shim that handles messages until the full runtime is ready.
-
-| Property | Detail |
-|---|---|
-| **Routing** | Calls proxy at `127.0.0.1:18790/v1/chat/completions` (OpenAI format, non-streaming) |
-| **Agentic loop** | Up to 20 iterations of tool-call → tool-result → assistant-response |
-| **Tools (17)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `install_skill`, `uninstall_skill`, `list_skills`, `manage_api_key` (native file), `manage_secret` (Secrets Manager), `retrieve_api_key` (unified lookup), `migrate_api_key` (between backends), `web_fetch`, `web_search` |
-| **File/cron tools** | Execute skill scripts via `execFile` with isolated env vars |
-| **Web tools** | In-process HTTP(S) with SSRF prevention (blocked IPs, DNS rebinding mitigation, redirect validation) |
-| **SSRF protection** | Pre-connection hostname blocklist + post-DNS-resolution IP validation covering loopback, RFC-1918, RFC-6598, link-local (AWS IMDS), IPv6 ULA, IPv4-mapped IPv6 |
-| **Web limits** | 512KB raw HTML, 50KB text output, 15s timeout, 3 redirect max, 8 search results |
-| **Detection** | Appends deterministic `"_Warm-up mode — ..."` footer to every response; absence of footer = OpenClaw is handling messages |
-| **Handoff** | Contract server checks `openclawReady` flag; once true, all messages route via WebSocket bridge to OpenClaw |
+> **Note**: The lightweight agent (`bridge/lightweight-agent.js`) is retained in the codebase for reference but is no longer used in the routing path. All messages are handled exclusively by OpenClaw, ensuring conversation history and memory remain consistent.
 
 ## S3 Bucket Structure
 
