@@ -9,7 +9,7 @@ You have **web_search** and **web_fetch** tools available from the moment you st
 - **web_search**: Search the web for current information using DuckDuckGo (no API key needed)
 - **web_fetch**: Fetch and read any web page content as plain text
 
-Use these for real-time information, news, research, and reading web pages. They work during both the warm-up phase and after full startup.
+Use these for real-time information, news, research, and reading web pages.
 
 ## ClawHub Skills (Pre-installed)
 
