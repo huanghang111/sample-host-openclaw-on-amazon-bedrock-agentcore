@@ -67,6 +67,11 @@ class AgentCoreStack(Stack):
             connection=ec2.Port.tcp(443),
             description="HTTPS to VPC endpoints and internet (web_fetch/web_search tools)",
         )
+        self.agent_sg.add_egress_rule(
+            peer=ec2.Peer.any_ipv4(),
+            connection=ec2.Port.tcp(993),
+            description="IMAPS for email access (port 993)",
+        )
         self.agent_sg.add_ingress_rule(
             peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
             connection=ec2.Port.tcp(443),

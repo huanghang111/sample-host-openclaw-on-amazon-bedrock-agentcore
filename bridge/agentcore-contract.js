@@ -318,6 +318,23 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
 // Must match the SUBAGENT_MODEL_NAME env var passed to the proxy.
 const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
 
+// Model provider switch — "bedrock" (default) uses the local agentcore-proxy → Bedrock Converse,
+// "litellm" bypasses the proxy and points OpenClaw directly at an external LiteLLM service.
+const MODEL_PROVIDER = (process.env.MODEL_PROVIDER || "bedrock").toLowerCase();
+const LITELLM_BASE_URL = process.env.LITELLM_BASE_URL || "";
+const LITELLM_API_KEY = process.env.LITELLM_API_KEY || "";
+const LITELLM_MODEL_NAME = process.env.LITELLM_MODEL_NAME || "gpt-4o";
+const LITELLM_SUBAGENT_MODEL_NAME = process.env.LITELLM_SUBAGENT_MODEL_NAME || LITELLM_MODEL_NAME;
+if (MODEL_PROVIDER === "litellm") {
+  if (!LITELLM_BASE_URL) {
+    console.error("[contract] FATAL: MODEL_PROVIDER=litellm but LITELLM_BASE_URL is not set.");
+    process.exit(1);
+  }
+  console.log(`[contract] Model provider: litellm → ${LITELLM_BASE_URL} (model=${LITELLM_MODEL_NAME})`);
+} else {
+  console.log(`[contract] Model provider: bedrock → local proxy :${PROXY_PORT}`);
+}
+
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
  * Full tool profile with deny list for unsafe/irrelevant tools.
@@ -331,8 +348,30 @@ function writeOpenClawConfig() {
   // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
   const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
 
-  const config = {
-    models: {
+  // Model provider configuration — bedrock uses local proxy, litellm uses external service
+  let modelsConfig;
+  if (MODEL_PROVIDER === "litellm") {
+    const litellmSubagentModel = `litellm/${LITELLM_SUBAGENT_MODEL_NAME}`;
+    modelsConfig = {
+      providers: {
+        litellm: {
+          baseUrl: LITELLM_BASE_URL,
+          apiKey: LITELLM_API_KEY || "not-needed",
+          api: "openai-completions",
+          models: [
+            { id: LITELLM_MODEL_NAME, name: "LiteLLM Primary" },
+            ...(LITELLM_SUBAGENT_MODEL_NAME !== LITELLM_MODEL_NAME
+              ? [{ id: LITELLM_SUBAGENT_MODEL_NAME, name: "LiteLLM Subagent" }]
+              : []),
+          ],
+        },
+      },
+    };
+    // Override subagent model reference for litellm
+    var primaryModel = `litellm/${LITELLM_MODEL_NAME}`;
+    var subagentModelRef = litellmSubagentModel;
+  } else {
+    modelsConfig = {
       providers: {
         agentcore: {
           baseUrl: `http://127.0.0.1:${PROXY_PORT}/v1`,
@@ -344,12 +383,18 @@ function writeOpenClawConfig() {
           ],
         },
       },
-    },
+    };
+    var primaryModel = "agentcore/bedrock-agentcore";
+    var subagentModelRef = subagentModel;
+  }
+
+  const config = {
+    models: modelsConfig,
     agents: {
       defaults: {
-        model: { primary: "agentcore/bedrock-agentcore" },
+        model: { primary: primaryModel },
         subagents: {
-          model: subagentModel,
+          model: subagentModelRef,
           maxConcurrent: 2,
           runTimeoutSeconds: 900,
           archiveAfterMinutes: 60,
@@ -866,33 +911,39 @@ async function init(userId, actorId, channel) {
 
     // 2. Start the Bedrock proxy with user identity env vars
     // Only pass required env vars — avoid leaking secrets via process.env spread
-    console.log("[contract] Starting Bedrock proxy...");
-    const proxyEnv = {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME || "/root",
-      NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
-      NODE_OPTIONS: process.env.NODE_OPTIONS || "",
-      AWS_REGION: process.env.AWS_REGION || "us-west-2",
-      BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
-      COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
-      COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-      COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
-      S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
-      SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
-      SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
-      USER_ID: actorId,
-      INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
-      CHANNEL: channel,
-      OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
-    };
-    proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
-      env: proxyEnv,
-      stdio: "inherit",
-    });
-    proxyProcess.on("exit", (code) => {
-      console.log(`[contract] Proxy exited with code ${code}`);
-      proxyReady = false;
-    });
+    // Skip proxy when using LiteLLM — OpenClaw connects directly to external service.
+    if (MODEL_PROVIDER !== "litellm") {
+      console.log("[contract] Starting Bedrock proxy...");
+      const proxyEnv = {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME || "/root",
+        NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
+        NODE_OPTIONS: process.env.NODE_OPTIONS || "",
+        AWS_REGION: process.env.AWS_REGION || "us-west-2",
+        BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
+        COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
+        COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
+        COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
+        S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
+        SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
+        SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
+        USER_ID: actorId,
+        INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
+        CHANNEL: channel,
+        OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
+      };
+      proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
+        env: proxyEnv,
+        stdio: "inherit",
+      });
+      proxyProcess.on("exit", (code) => {
+        console.log(`[contract] Proxy exited with code ${code}`);
+        proxyReady = false;
+      });
+    } else {
+      console.log("[contract] MODEL_PROVIDER=litellm — skipping local Bedrock proxy");
+      proxyReady = true; // No proxy needed, mark as ready immediately
+    }
 
     // Wait for lock cleanup to complete before starting OpenClaw
     await lockCleanupPromise;
@@ -963,14 +1014,17 @@ async function init(userId, actorId, channel) {
     });
 
     // 2. Wait only for proxy readiness (~5s)
-    proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
-    if (!proxyReady) {
-      throw new Error("Proxy failed to start within 30s");
-    }
+    // Skip when using LiteLLM — no local proxy to wait for.
+    if (MODEL_PROVIDER !== "litellm") {
+      proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
+      if (!proxyReady) {
+        throw new Error("Proxy failed to start within 30s");
+      }
 
-    // 2b. Warm proxy JIT — send a lightweight request to trigger V8 compilation
-    // of the request handling path, so the first real user message is faster.
-    warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+      // 2b. Warm proxy JIT — send a lightweight request to trigger V8 compilation
+      // of the request handling path, so the first real user message is faster.
+      warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+    }
 
     // 3. Poll for OpenClaw readiness in the background (don't block)
     pollOpenClawReadiness(namespace).catch((err) => {
@@ -1687,39 +1741,50 @@ const server = http.createServer(async (req, res) => {
                 console.warn(
                   "[contract] Bridge returned empty — falling back to lightweight agent",
                 );
-                try {
-                  responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
-                } catch (agentErr) {
-                  responseText =
-                    "I'm having trouble right now. Please try again in a moment.";
-                  console.error(
-                    `[contract] Lightweight agent fallback error: ${agentErr.message}`,
-                  );
+                // LiteLLM mode: no local proxy → lightweight agent won't work
+                if (MODEL_PROVIDER === "litellm") {
+                  responseText = "I received your message but got an empty response. Please try again.";
+                } else {
+                  try {
+                    responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
+                  } catch (agentErr) {
+                    responseText =
+                      "I'm having trouble right now. Please try again in a moment.";
+                    console.error(
+                      `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                    );
+                  }
                 }
               }
             } else if (proxyReady) {
               // Warm-up shim path — lightweight agent via proxy
-              console.log("[contract] Routing via lightweight agent (warm-up)");
-              try {
-                responseText = await agent.chat(
-                  bridgeText,
-                  actorId,
-                  Date.now() + 560000,
-                  warmupHistory,
-                );
-                // Accumulate history for OpenClaw handoff (strip warm-up footer)
-                if (warmupHistory.length < MAX_WARMUP_HISTORY) {
-                  warmupHistory.push({ role: "user", content: bridgeText });
-                  warmupHistory.push({
-                    role: "assistant",
-                    content: stripWarmupFooter(responseText),
-                  });
+              // LiteLLM mode: no local proxy, so wait for OpenClaw instead of using shim
+              if (MODEL_PROVIDER === "litellm") {
+                console.log("[contract] LiteLLM mode — waiting for OpenClaw (no lightweight agent)");
+                responseText = "I'm starting up — please try again in about a minute.";
+              } else {
+                console.log("[contract] Routing via lightweight agent (warm-up)");
+                try {
+                  responseText = await agent.chat(
+                    bridgeText,
+                    actorId,
+                    Date.now() + 560000,
+                    warmupHistory,
+                  );
+                  // Accumulate history for OpenClaw handoff (strip warm-up footer)
+                  if (warmupHistory.length < MAX_WARMUP_HISTORY) {
+                    warmupHistory.push({ role: "user", content: bridgeText });
+                    warmupHistory.push({
+                      role: "assistant",
+                      content: stripWarmupFooter(responseText),
+                    });
+                  }
+                } catch (agentErr) {
+                  responseText = `I'm having trouble right now. Please try again in a moment.`;
+                  console.error(
+                    `[contract] Lightweight agent error: ${agentErr.message}`,
+                  );
                 }
-              } catch (agentErr) {
-                responseText = `I'm having trouble right now. Please try again in a moment.`;
-                console.error(
-                  `[contract] Lightweight agent error: ${agentErr.message}`,
-                );
               }
             } else {
               // Proxy not ready yet (should be rare — init awaits proxy)
