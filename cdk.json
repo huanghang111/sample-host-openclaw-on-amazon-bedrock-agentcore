@@ -28,11 +28,14 @@
     "ws_bridge_enabled": true,
     "ws_bridge_cpu": 256,
     "ws_bridge_memory_mb": 512,
+    "admin_lambda_timeout_seconds": 60,
+    "admin_lambda_memory_mb": 256,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,
     "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true,
     "@aws-cdk/core:enablePartitionLiterals": true,
     "@aws-cdk/aws-iam:minimizePolicies": true,
-    "@aws-cdk/customresources:installLatestAwsSdkDefault": false
+    "@aws-cdk/customresources:installLatestAwsSdkDefault": false,
+    "ws_bridge_image_tag": "build-cc24fbcf"
   }
 }

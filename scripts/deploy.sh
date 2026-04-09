@@ -4,7 +4,8 @@
 # Three-phase deployment:
 #   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
 #   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build, Runtime, Endpoint)
-#   Phase 3: CDK deploys dependent stacks (Router, Cron, WsBridge, TokenMonitoring)
+#   Phase 3: CDK deploys dependent stacks (Router, Cron, WsBridge, Admin, TokenMonitoring)
+#            + builds and deploys Admin Console frontend to S3/CloudFront
 #
 # Usage:
 #   ./scripts/deploy.sh                  # full 3-phase deploy
@@ -13,6 +14,7 @@
 #   ./scripts/deploy.sh --phase1         # Phase 1 only
 #   ./scripts/deploy.sh --phase3         # Phase 3 only (assumes runtime already deployed)
 #   ./scripts/deploy.sh --ws-bridge-only # build WS Bridge image only (via CodeBuild)
+#   ./scripts/deploy.sh --admin-only     # Admin Console stack + frontend only
 #
 # Environment variables:
 #   BUILD_MODE          codebuild (default) or local-build
@@ -828,10 +830,22 @@ phase3_cdk() {
     OpenClawRouter \
     OpenClawCron \
     OpenClawWsBridge \
+    OpenClawAdmin \
     OpenClawTokenMonitoring \
     --require-approval never
 
   echo "  Phase 3 complete."
+  echo ""
+}
+
+# --- Deploy Admin UI (build frontend + sync to S3 + invalidate CloudFront) ---
+deploy_admin_ui() {
+  echo "=== Deploying Admin Console frontend ==="
+  if [ -f "$PROJECT_DIR/scripts/deploy-admin-ui.sh" ]; then
+    bash "$PROJECT_DIR/scripts/deploy-admin-ui.sh"
+  else
+    echo "  SKIP: scripts/deploy-admin-ui.sh not found."
+  fi
   echo ""
 }
 
@@ -848,17 +862,26 @@ case "$MODE" in
   --phase3)
     build_ws_bridge_image
     phase3_cdk
+    deploy_admin_ui
     ;;
   --cdk-only)
     phase1_cdk
     build_ws_bridge_image
     phase3_cdk
+    deploy_admin_ui
+    ;;
+  --admin-only)
+    cd "$PROJECT_DIR"
+    activate_venv
+    cdk deploy OpenClawAdmin --require-approval never
+    deploy_admin_ui
     ;;
   *)
     phase1_cdk
     phase2_toolkit
     build_ws_bridge_image
     phase3_cdk
+    deploy_admin_ui
     ;;
 esac
 
@@ -869,3 +892,4 @@ echo "  1. Set up Telegram:          ./scripts/setup-telegram.sh"
 echo "  2. Set up Slack:             ./scripts/setup-slack.sh"
 echo "  3. Set up Feishu (webhook):  ./scripts/setup-feishu.sh"
 echo "  4. Set up DingTalk/Feishu (WS multi-bot): ./scripts/setup-multi-bot.sh"
+echo "  5. Create admin user:        ./scripts/setup-admin.sh <email>"
