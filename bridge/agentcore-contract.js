@@ -94,6 +94,9 @@ const OPENCLAW_RESTART_DELAY_MS = 5000;
 
 // Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
 let activeTaskCount = 0;
+// Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
+// Initialized to startup time; updated on each chat/cron/warmup invocation.
+let lastActivityTime = Math.floor(Date.now() / 1000);
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
@@ -351,6 +354,11 @@ function writeOpenClawConfig() {
     },
     tools: {
       profile: "full",
+      exec: {
+        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
+        security: "full", // Full shell access; container is already isolated
+        ask: "off",       // Headless container — no approval UI
+      },
       deny: [
         "write", // Local writes don't persist — use S3 skill instead
         "edit", // Local edits are ephemeral — use S3 skill instead
@@ -875,7 +883,13 @@ async function init(userId, actorId, channel) {
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+    proxyProcess.stdout.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
+    });
+    proxyProcess.stderr.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
     });
     proxyProcess.on("exit", (code) => {
       console.log(`[contract] Proxy exited with code ${code}`);
@@ -1094,7 +1108,7 @@ async function processMessageQueue() {
     );
 
     try {
-      const response = await bridgeMessage(message, 560000);
+      const response = await bridgeMessage(message, 620000);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -1122,7 +1136,7 @@ function enqueueMessage(message) {
 /**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
  */
-async function bridgeMessage(message, timeoutMs = 560000) {
+async function bridgeMessage(message, timeoutMs = 620000) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
@@ -1386,7 +1400,7 @@ const server = http.createServer(async (req, res) => {
     const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
     const responseBody = {
       status,
-      time_of_last_update: Math.floor(Date.now() / 1000),
+      time_of_last_update: lastActivityTime,
       active_tasks: activeTaskCount,
     };
 
@@ -1453,6 +1467,7 @@ const server = http.createServer(async (req, res) => {
 
         // Warmup action — trigger lazy init without blocking for a chat response
         if (action === "warmup") {
+          lastActivityTime = Math.floor(Date.now() / 1000);
           const { userId, actorId, channel } = payload;
           if (openclawReady && proxyReady) {
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -1517,6 +1532,7 @@ const server = http.createServer(async (req, res) => {
           }
 
           // Track active task to prevent idle termination during cron processing
+          lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
           let responseText;
           try {
@@ -1634,6 +1650,7 @@ const server = http.createServer(async (req, res) => {
           const bridgeText = buildBridgeText(message);
 
           // Track active task to prevent idle termination during chat processing
+          lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
           let responseText;
           try {
