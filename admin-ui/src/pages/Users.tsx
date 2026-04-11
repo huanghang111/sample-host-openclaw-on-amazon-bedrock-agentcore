@@ -20,6 +20,8 @@ import {
   EyeOutlined,
   DisconnectOutlined,
   DeleteOutlined,
+  PoweroffOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { get, post, del } from '../services/api';
@@ -55,6 +57,14 @@ interface UserDetail extends UserSummary {
   }[];
 }
 
+interface RuntimeSession {
+  userId: string;
+  displayName?: string;
+  sessionId: string;
+  createdAt: string;
+  lastActivity: string;
+}
+
 interface AllowlistEntry {
   channelKey: string;
   addedAt: string;
@@ -75,6 +85,10 @@ export default function Users() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  const [sessions, setSessions] = useState<RuntimeSession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [stoppingSession, setStoppingSession] = useState<string | null>(null);
+
   const [allowlist, setAllowlist] = useState<AllowlistEntry[]>([]);
   const [allowlistLoading, setAllowlistLoading] = useState(false);
   const [addModalOpen, setAddModalOpen] = useState(false);
@@ -88,6 +102,14 @@ export default function Users() {
       .finally(() => setLoading(false));
   }, []);
 
+  const fetchSessions = useCallback(() => {
+    setSessionsLoading(true);
+    get<{ sessions: RuntimeSession[] }>('/api/sessions')
+      .then((data) => setSessions(data.sessions))
+      .catch(console.error)
+      .finally(() => setSessionsLoading(false));
+  }, []);
+
   const fetchAllowlist = useCallback(() => {
     setAllowlistLoading(true);
     get<{ entries: AllowlistEntry[] }>('/api/allowlist')
@@ -98,8 +120,9 @@ export default function Users() {
 
   useEffect(() => {
     fetchUsers();
+    fetchSessions();
     fetchAllowlist();
-  }, [fetchUsers, fetchAllowlist]);
+  }, [fetchUsers, fetchSessions, fetchAllowlist]);
 
   const openDetail = async (userId: string) => {
     setDrawerOpen(true);
@@ -122,6 +145,18 @@ export default function Users() {
     } catch {
       message.error('Failed to delete user');
     }
+  };
+
+  const handleStopSession = async (sessionId: string) => {
+    setStoppingSession(sessionId);
+    try {
+      await post(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {});
+      message.success('Session stopped');
+      fetchSessions();
+    } catch {
+      message.error('Failed to stop session');
+    }
+    setStoppingSession(null);
   };
 
   const handleUnbindChannel = async (
@@ -239,6 +274,60 @@ export default function Users() {
     },
   ];
 
+  const sessionColumns: ColumnsType<RuntimeSession> = [
+    {
+      title: 'User',
+      key: 'user',
+      render: (_: unknown, record: RuntimeSession) =>
+        record.displayName
+          ? `${record.displayName} (${record.userId.slice(0, 8)}...)`
+          : record.userId,
+      ellipsis: true,
+    },
+    {
+      title: 'Session ID',
+      dataIndex: 'sessionId',
+      key: 'sessionId',
+      ellipsis: true,
+      render: (v: string) => <Text code copyable={{ text: v }}>{v}</Text>,
+    },
+    {
+      title: 'Started At',
+      dataIndex: 'createdAt',
+      key: 'createdAt',
+      width: 180,
+      render: (v: string) => (v ? new Date(v).toLocaleString() : '-'),
+    },
+    {
+      title: 'Last Activity',
+      dataIndex: 'lastActivity',
+      key: 'lastActivity',
+      width: 180,
+      render: (v: string) => (v ? new Date(v).toLocaleString() : '-'),
+    },
+    {
+      title: 'Actions',
+      key: 'actions',
+      width: 120,
+      render: (_: unknown, record: RuntimeSession) => (
+        <Popconfirm
+          title="Stop this session?"
+          description="The user's container will be terminated. A new session starts on next message."
+          onConfirm={() => handleStopSession(record.sessionId)}
+        >
+          <Button
+            size="small"
+            danger
+            icon={<PoweroffOutlined />}
+            loading={stoppingSession === record.sessionId}
+          >
+            Stop
+          </Button>
+        </Popconfirm>
+      ),
+    },
+  ];
+
   const allowlistColumns: ColumnsType<AllowlistEntry> = [
     {
       title: 'Channel Key',
@@ -299,6 +388,32 @@ export default function Users() {
                   loading={loading}
                   pagination={{ pageSize: 20 }}
                   size="middle"
+                />
+              </>
+            ),
+          },
+          {
+            key: 'sessions',
+            label: `Sessions (${sessions.length})`,
+            children: (
+              <>
+                <div style={{ marginBottom: 16 }}>
+                  <Button
+                    icon={<ReloadOutlined />}
+                    onClick={fetchSessions}
+                    loading={sessionsLoading}
+                  >
+                    Refresh
+                  </Button>
+                </div>
+                <Table
+                  columns={sessionColumns}
+                  dataSource={sessions}
+                  rowKey="sessionId"
+                  loading={sessionsLoading}
+                  pagination={{ pageSize: 20 }}
+                  size="middle"
+                  locale={{ emptyText: 'No active sessions' }}
                 />
               </>
             ),

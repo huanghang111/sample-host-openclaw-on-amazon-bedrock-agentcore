@@ -147,6 +147,7 @@ admin_stack = AdminStack(
     dingtalk_secret_name=security_stack.channel_secrets["dingtalk"].secret_name,
     webhook_secret_name=security_stack.webhook_secret.secret_name,
     ws_bridge_bots_secret_name=security_stack.ws_bridge_bots_secret.secret_name,
+    runtime_arn=agentcore_stack.runtime_arn,
     env=env,
 )
 

@@ -25,6 +25,7 @@ DINGTALK_SECRET_ID = os.environ.get("DINGTALK_SECRET_ID", "")
 WS_BRIDGE_BOTS_SECRET_ID = os.environ.get("WS_BRIDGE_BOTS_SECRET_ID", "")
 ROUTER_API_URL = os.environ.get("ROUTER_API_URL", "")
 SKILL_EVAL_FUNCTION_NAME = os.environ.get("SKILL_EVAL_FUNCTION_NAME", "")
+AGENTCORE_RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 
 # --- AWS Clients ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -36,6 +37,7 @@ s3_client = boto3.client(
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 scheduler_client = boto3.client("scheduler", region_name=AWS_REGION)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+agentcore_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
 
 # --- Secret cache (15 min TTL) ---
 _SECRET_CACHE_TTL = 900
@@ -931,6 +933,92 @@ def _handle_post_skill_eval(event):
     except ClientError as e:
         logger.error("Failed to invoke skill-eval: %s", e)
         return _json_response(500, {"error": "Failed to invoke skill eval"})
+
+
+# ---- Sessions ----
+
+@route("GET", "/api/sessions")
+def _handle_get_sessions(event):
+    """GET /api/sessions — list all active runtime sessions from DynamoDB."""
+    items = []
+    params = {
+        "FilterExpression": "begins_with(PK, :u) AND SK = :sk",
+        "ExpressionAttributeValues": {":u": "USER#", ":sk": "SESSION"},
+    }
+    while True:
+        resp = identity_table.scan(**params)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            break
+        params["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    # Enrich with user profile info
+    sessions = []
+    for item in items:
+        user_id = item.get("PK", "").replace("USER#", "")
+        sessions.append({
+            "userId": user_id,
+            "sessionId": item.get("sessionId", ""),
+            "createdAt": item.get("createdAt", ""),
+            "lastActivity": item.get("lastActivity", ""),
+        })
+
+    # Sort by lastActivity descending
+    sessions.sort(key=lambda s: s.get("lastActivity", ""), reverse=True)
+
+    # Fetch display names in batch
+    user_ids = [s["userId"] for s in sessions]
+    for s in sessions:
+        try:
+            resp = identity_table.get_item(
+                Key={"PK": f"USER#{s['userId']}", "SK": "PROFILE"}
+            )
+            profile = resp.get("Item", {})
+            s["displayName"] = profile.get("displayName", "")
+        except ClientError:
+            s["displayName"] = ""
+
+    return _json_response(200, {"sessions": sessions})
+
+
+@route("POST", "/api/sessions/{sessionId}/stop")
+def _handle_stop_session(event):
+    """POST /api/sessions/{sessionId}/stop — stop an AgentCore runtime session."""
+    session_id = event["pathParameters"]["sessionId"]
+    admin_sub = _get_admin_sub(event)
+
+    if not AGENTCORE_RUNTIME_ARN:
+        return _json_response(503, {"error": "AGENTCORE_RUNTIME_ARN not configured"})
+
+    try:
+        agentcore_client.stop_runtime_session(
+            runtimeSessionId=session_id,
+            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
+        )
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "ResourceNotFoundException":
+            # Session already stopped / not found — clean up DynamoDB anyway
+            logger.info("Session %s not found on runtime, cleaning up DynamoDB", session_id)
+        else:
+            logger.error("Failed to stop session %s: %s", session_id, e)
+            return _json_response(500, {"error": f"Failed to stop session: {error_code}"})
+
+    # Remove SESSION record from DynamoDB (find user by scanning)
+    try:
+        resp = identity_table.scan(
+            FilterExpression="SK = :sk AND sessionId = :sid",
+            ExpressionAttributeValues={":sk": "SESSION", ":sid": session_id},
+        )
+        for item in resp.get("Items", []):
+            identity_table.delete_item(
+                Key={"PK": item["PK"], "SK": "SESSION"}
+            )
+    except ClientError as e:
+        logger.error("Failed to clean up session record: %s", e)
+
+    _audit_log(admin_sub, "STOP_SESSION", session_id)
+    return _json_response(200, {"message": f"Session {session_id} stopped"})
 
 
 def _match_route(method, path):

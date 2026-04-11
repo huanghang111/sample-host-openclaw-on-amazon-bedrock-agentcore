@@ -47,6 +47,7 @@ class AdminStack(Stack):
         dingtalk_secret_name: str,
         webhook_secret_name: str,
         ws_bridge_bots_secret_name: str,
+        runtime_arn: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -174,6 +175,7 @@ class AdminStack(Stack):
                 "DINGTALK_SECRET_ID": dingtalk_secret_name,
                 "WS_BRIDGE_BOTS_SECRET_ID": ws_bridge_bots_secret_name,
                 "ROUTER_API_URL": router_api_url,
+                "AGENTCORE_RUNTIME_ARN": runtime_arn,
             },
             log_group=admin_log_group,
         )
@@ -253,6 +255,15 @@ class AdminStack(Stack):
                 ],
             )
         )
+
+        # Bedrock AgentCore — stop runtime sessions
+        if runtime_arn:
+            self.admin_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock-agentcore:StopRuntimeSession"],
+                    resources=[runtime_arn],
+                )
+            )
 
         # KMS
         self.admin_fn.add_to_role_policy(
