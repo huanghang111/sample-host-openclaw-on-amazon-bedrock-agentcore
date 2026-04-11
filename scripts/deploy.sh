@@ -394,6 +394,11 @@ read_cdk_outputs() {
   # Read config values from cdk.json
   DEFAULT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-opus-4-6-v1'))")
   SUBAGENT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id',''))")
+  MODEL_PROVIDER=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('model_provider','bedrock'))")
+  LITELLM_BASE_URL=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('litellm_base_url',''))")
+  LITELLM_API_KEY=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('litellm_api_key',''))")
+  LITELLM_MODEL_NAME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('litellm_model_name',''))")
+  LITELLM_SUBAGENT_MODEL_NAME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('litellm_subagent_model_name',''))")
   IMAGE_VERSION=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('image_version','1'))")
   WORKSPACE_SYNC_MS=$(python3 -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_sync_interval_seconds',300))*1000)")
   CRON_LEAD_TIME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('cron_lead_time_minutes',5))")
@@ -486,7 +491,7 @@ phase2_toolkit() {
   "$AGENTCORE_CLI" deploy \
     --agent openclaw_agent \
     --auto-update-on-conflict \
-    "${deploy_flags[@]}" \
+    ${deploy_flags[@]+"${deploy_flags[@]}"} \
     --env "AWS_REGION=$REGION" \
     --env "BEDROCK_MODEL_ID=$DEFAULT_MODEL_ID" \
     --env "GATEWAY_TOKEN_SECRET_ID=$GATEWAY_TOKEN_SECRET_ID" \
@@ -503,7 +508,12 @@ phase2_toolkit() {
     --env "EVENTBRIDGE_ROLE_ARN=arn:aws:iam::${ACCOUNT}:role/openclaw-cron-scheduler-role-${REGION}" \
     --env "IDENTITY_TABLE_NAME=openclaw-identity" \
     --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
-    --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID"
+    --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
+    --env "MODEL_PROVIDER=$MODEL_PROVIDER" \
+    --env "LITELLM_BASE_URL=$LITELLM_BASE_URL" \
+    --env "LITELLM_API_KEY=$LITELLM_API_KEY" \
+    --env "LITELLM_MODEL_NAME=$LITELLM_MODEL_NAME" \
+    --env "LITELLM_SUBAGENT_MODEL_NAME=$LITELLM_SUBAGENT_MODEL_NAME"
 
   # Read runtime ID from .bedrock_agentcore.yaml (most reliable source)
   echo "--- Reading runtime info ---"
