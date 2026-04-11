@@ -45,7 +45,7 @@ flowchart LR
 - **钉钉/飞书**：通过 WebSocket 连接到 WS Bridge（ECS Fargate）
 - **Telegram/Slack**：通过 Webhook 连接到 Router Lambda（API Gateway）
 - 所有渠道统一解析用户身份后路由到每用户独立的 AgentCore 容器
-- **Admin Console**：Web 管理界面，管理渠道配置、用户白名单、文件浏览等
+- **Admin Console**：Web 管理界面，管理渠道配置、用户白名单、运行时会话、文件浏览等
 
 ### 核心特性
 
@@ -60,7 +60,7 @@ flowchart LR
 - **API 密钥管理** — 双模式存储（本地文件 / AWS Secrets Manager）
 - **STS 会话凭证** — 每用户 S3 命名空间隔离，防止跨用户数据访问
 - **社区技能** — 5 个预装 ClawHub 技能（jina-reader、deep-research-pro 等）
-- **Admin Console** — Web 管理控制台（渠道配置、用户/白名单管理、文件浏览、技能安全扫描）
+- **Admin Console** — Web 管理控制台（渠道配置、用户/白名单管理、运行时会话管理、文件浏览、技能安全扫描）
 
 ---
 
@@ -333,7 +333,13 @@ agentcore status --agent openclaw_agent --verbose
 
 ### 停止用户会话
 
-部署新镜像后需停止旧会话，下次消息自动使用新容器：
+部署新镜像后需停止旧会话，下次消息自动使用新容器。
+
+**方式一：通过 Admin Console（推荐）**
+
+在 Admin Console 的 **Users → Sessions** 标签页中查看所有活跃会话，点击 **Stop** 按钮停止指定会话。
+
+**方式二：通过 CLI**
 
 ```bash
 # 查找会话 ID
@@ -392,7 +398,7 @@ Web 管理控制台，替代 CLI 脚本进行日常管理操作。
 |------|------|
 | **Dashboard** | 用户总数、白名单数、渠道分布、渠道配置状态 |
 | **Channels** | 配置 Telegram/Slack/Feishu/DingTalk 凭证、注册 Webhook、管理 Multi-Bot Bridge |
-| **Users** | 查看/删除用户、管理渠道绑定、管理白名单 |
+| **Users** | 查看/删除用户、管理渠道绑定、管理白名单、查看/停止运行时会话 |
 | **Files** | 按用户浏览 S3 文件、查看文本文件内容、删除文件、触发技能安全扫描 |
 
 ### 部署

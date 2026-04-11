@@ -14,13 +14,13 @@ Add a serverless admin control plane to the OpenClaw on AgentCore project. The c
 2. **Multi-Bot Management** — View, add, enable/disable, and delete DingTalk and Feishu WebSocket bots in the WS Bridge (`openclaw/ws-bridge/bots` secret)
 3. **User Management** — View, add, and delete users and allowlist entries; view cross-channel bindings; manage individual channel access
 4. **File Management** — Browse and delete per-user S3 files (both `.openclaw/` workspace and user-created files)
-5. **Dashboard** — At-a-glance stats: user count, channel distribution, channel config status
-6. **Admin Authentication** — Secure login/logout via a dedicated Cognito User Pool (separate from the bot identity pool)
+5. **Session Management** — View all active AgentCore runtime sessions and manually stop sessions (e.g., after deploying a new container image)
+6. **Dashboard** — At-a-glance stats: user count, channel distribution, channel config status
+7. **Admin Authentication** — Secure login/logout via a dedicated Cognito User Pool (separate from the bot identity pool)
 
 ## Non-Goals
 
 - Modifying OpenClaw runtime configuration (model ID, session timeouts, etc.)
-- Viewing or managing AgentCore runtime/sessions directly
 - Real-time log viewing or monitoring (existing CloudWatch dashboards serve this)
 - Multi-tenant admin (single admin pool for the deployment)
 
@@ -50,13 +50,18 @@ Add a serverless admin control plane to the OpenClaw on AgentCore project. The c
                         │    function, routed) │
                         └──────────┬──────────┘
                                    │
-              ┌────────────────────┼────────────────────┐
-              │                    │                     │
-     ┌────────┴────────┐  ┌───────┴────────┐  ┌────────┴────────┐
-     │   DynamoDB       │  │ Secrets Manager │  │    S3 Bucket    │
-     │ openclaw-identity│  │ Channel tokens  │  │ User files +    │
-     │                  │  │                 │  │ workspace       │
-     └─────────────────┘  └────────────────┘  └─────────────────┘
+              ┌──────────────┬─────┼─────────────┬──────┐
+              │              │     │              │      │
+     ┌────────┴────────┐  ┌─┴─────┴──────┐  ┌───┴──────┴──────┐
+     │   DynamoDB       │  │ Secrets Mgr  │  │    S3 Bucket    │
+     │ openclaw-identity│  │ Channel tkns │  │ User files +    │
+     │                  │  │              │  │ workspace       │
+     └─────────────────┘  └──────────────┘  └─────────────────┘
+                                   │
+                        ┌──────────┴──────────┐
+                        │  Bedrock AgentCore   │
+                        │  (StopRuntimeSession)│
+                        └─────────────────────┘
 ```
 
 ### Why a Separate Cognito User Pool?
@@ -121,6 +126,7 @@ FEISHU_SECRET_ID       = openclaw/channels/feishu
 DINGTALK_SECRET_ID     = openclaw/channels/dingtalk
 WS_BRIDGE_BOTS_SECRET_ID = openclaw/ws-bridge/bots
 ROUTER_API_URL         = {Router API Gateway URL, imported from Router stack output}
+AGENTCORE_RUNTIME_ARN  = {AgentCore Runtime ARN, imported from AgentCore stack}
 ```
 
 #### Lambda IAM Policy
@@ -174,6 +180,12 @@ ROUTER_API_URL         = {Router API Gateway URL, imported from Router stack out
     - scheduler:DeleteSchedule
   Resource:
     - arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*
+
+- Effect: Allow
+  Action:
+    - bedrock-agentcore:StopRuntimeSession
+  Resource:
+    - {AgentCore Runtime ARN}
 
 - Effect: Allow
   Action:
@@ -331,6 +343,27 @@ Manages DingTalk and Feishu WebSocket bots in the `openclaw/ws-bridge/bots` Secr
 { "channelKey": "telegram:123456789" }
 ```
 
+#### Session Management
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/sessions` | List all active runtime sessions (from DynamoDB SESSION records) |
+| `POST` | `/api/sessions/{sessionId}/stop` | Stop an AgentCore runtime session |
+
+**GET `/api/sessions` implementation**:
+1. Scan DynamoDB with `FilterExpression: PK begins_with USER# AND SK = SESSION`
+2. For each session, fetch the user's PROFILE record for display name enrichment
+3. Sort by `lastActivity` descending
+4. Return list with `userId`, `displayName`, `sessionId`, `createdAt`, `lastActivity`
+
+**POST `/api/sessions/{sessionId}/stop` implementation**:
+1. Call `bedrock-agentcore:StopRuntimeSession` with the session ID and runtime ARN
+2. If `ResourceNotFoundException` — session already stopped, continue cleanup
+3. Scan DynamoDB for the SESSION record matching the session ID and delete it
+4. Emit audit log
+
+**Note**: SESSION records in DynamoDB represent the last known session for each user. After stopping, the record is deleted. The user's next message will create a new session with a fresh container.
+
 #### File Management
 
 | Method | Path | Description |
@@ -372,7 +405,7 @@ Manages DingTalk and Feishu WebSocket bots in the `openclaw/ws-bridge/bots` Secr
 }
 ```
 
-**Note**: `activeSessions` removed from stats — there is no reliable way to count truly active AgentCore sessions from DynamoDB alone (SESSION records persist beyond container termination). Counting DynamoDB SESSION records would be misleading.
+**Note**: `activeSessions` removed from stats — session management is handled via the dedicated Sessions tab under the Users page, where admins can view all sessions from DynamoDB and stop them via the AgentCore data plane API.
 
 ### Frontend Design
 
@@ -435,17 +468,21 @@ The deploy script (`deploy-admin-ui.sh`) reads these from CloudFormation outputs
   - Delete button with confirmation
 
 **4. Users** (`/users`)
-- Table: User ID, Display Name, Channels (tags), Created At, Actions
-- Actions: View Detail, Delete
-- "Add to Allowlist" button (modal: enter channel key like `telegram:123456`)
-- User detail drawer:
-  - Profile info
-  - Bound channels list with individual "Unbind" buttons
-  - Active session info (session ID, created at, last activity)
-  - Cron schedules table (name, expression, timezone, channel)
-- Search by user ID or display name
-- Filter by channel type
-- Pagination controls
+- Three tabs: **Users**, **Sessions**, **Allowlist**
+- **Users tab**:
+  - Table: User ID, Display Name, Channels (tags), Created At, Actions
+  - Actions: View Detail, Delete
+  - User detail drawer: profile, channels (unbind), session info, cron schedules
+  - Search by user ID or display name
+  - Pagination controls
+- **Sessions tab**:
+  - Table: User (name + ID), Session ID (copyable), Started At, Last Activity, Actions
+  - "Refresh" button to reload session list
+  - "Stop" button per session with confirmation popover (calls `bedrock-agentcore:StopRuntimeSession`)
+  - Tab label shows active session count: `Sessions (N)`
+- **Allowlist tab**:
+  - Table: Channel Key, Added At, Actions (Delete)
+  - "Add to Allowlist" button (modal: enter channel key like `telegram:123456`)
 
 **5. Files** (`/files`)
 - Left panel: User list (S3 namespaces enriched with display name + channel key from DynamoDB)
