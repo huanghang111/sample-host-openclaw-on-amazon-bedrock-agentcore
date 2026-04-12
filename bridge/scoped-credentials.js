@@ -113,6 +113,7 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
           "kms:Decrypt", "kms:GenerateDataKey",
           "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
           "iam:PassRole",
+          "bedrock-agentcore:InvokeGateway",
         ],
         Resource: "*",
       },

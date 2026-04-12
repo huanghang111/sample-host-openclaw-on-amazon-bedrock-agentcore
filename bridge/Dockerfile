@@ -137,6 +137,10 @@ RUN chmod +x /skills/api-keys/*.js
 COPY skills/agentcore-browser /skills/agentcore-browser
 RUN chmod +x /skills/agentcore-browser/*.js
 
+# Copy AgentCore Gateway skill (MCP tool discovery and invocation)
+COPY skills/agentcore-gateway /skills/agentcore-gateway
+RUN chmod +x /skills/agentcore-gateway/*.js
+
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md
 

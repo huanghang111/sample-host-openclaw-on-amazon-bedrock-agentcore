@@ -115,6 +115,18 @@ class VpcStack(Stack):
                 private_dns_enabled=True,
             )
 
+        # AgentCore Gateway endpoint: resolves *.gateway.bedrock-agentcore.{region}.amazonaws.com
+        # Required for containers to reach AgentCore Gateway URLs via private DNS.
+        self.vpc.add_interface_endpoint(
+            "AgentCoreGatewayEndpoint",
+            service=ec2.InterfaceVpcEndpointService(
+                f"com.amazonaws.{self.region}.bedrock-agentcore.gateway"
+            ),
+            subnets=private_subnets,
+            security_groups=[self.vpce_sg],
+            private_dns_enabled=True,
+        )
+
         # S3 gateway endpoint (free, no SG needed)
         self.vpc.add_gateway_endpoint(
             "S3Endpoint",
