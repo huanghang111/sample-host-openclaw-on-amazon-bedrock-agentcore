@@ -275,6 +275,18 @@ class AgentCoreStack(Stack):
             )
         )
 
+        # AgentCore — gateway invocation, runtime invocation, workload access token
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "bedrock-agentcore:InvokeGateway",
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                ],
+                resources=["*"],
+            )
+        )
+
         # --- S3 Bucket for Per-User File Storage ------------------------------
         user_files_ttl_days = int(
             self.node.try_get_context("user_files_ttl_days") or "365"

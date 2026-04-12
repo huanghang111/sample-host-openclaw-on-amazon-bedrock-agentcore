@@ -330,6 +330,7 @@ phase1_cdk() {
     OpenClawSecurity \
     OpenClawGuardrails \
     OpenClawAgentCore \
+    OpenClawGateway \
     OpenClawObservability \
     --require-approval never
 
@@ -373,6 +374,12 @@ read_cdk_outputs() {
     --output text)
   # Extract secret name from ARN (last segment after last colon, strip random suffix)
   GATEWAY_TOKEN_SECRET_ID="openclaw/gateway-token"
+
+  # AgentCore Gateway URL (optional — only if OpenClawGateway stack is deployed)
+  AGENTCORE_GATEWAY_URL=$(aws cloudformation describe-stacks \
+    --stack-name OpenClawGateway --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" \
+    --output text 2>/dev/null || echo "")
 
   COGNITO_USER_POOL_ID=$(aws cloudformation describe-stacks \
     --stack-name OpenClawSecurity --region "$REGION" \
@@ -513,7 +520,8 @@ phase2_toolkit() {
     --env "LITELLM_BASE_URL=$LITELLM_BASE_URL" \
     --env "LITELLM_API_KEY=$LITELLM_API_KEY" \
     --env "LITELLM_MODEL_NAME=$LITELLM_MODEL_NAME" \
-    --env "LITELLM_SUBAGENT_MODEL_NAME=$LITELLM_SUBAGENT_MODEL_NAME"
+    --env "LITELLM_SUBAGENT_MODEL_NAME=$LITELLM_SUBAGENT_MODEL_NAME" \
+    ${AGENTCORE_GATEWAY_URL:+--env "AGENTCORE_GATEWAY_URL=$AGENTCORE_GATEWAY_URL"}
 
   # Read runtime ID from .bedrock_agentcore.yaml (most reliable source)
   echo "--- Reading runtime info ---"

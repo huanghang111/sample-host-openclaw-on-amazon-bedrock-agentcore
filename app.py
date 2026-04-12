@@ -26,6 +26,7 @@ from stacks.ws_bridge_stack import WsBridgeStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
 from stacks.admin_stack import AdminStack
+from stacks.gateway_stack import GatewayStack
 
 app = cdk.App()
 
@@ -65,6 +66,9 @@ agentcore_stack = AgentCoreStack(
     guardrail_version=guardrails_stack.guardrail_version or "",
     env=env,
 )
+
+# --- AgentCore Gateway (MCP tool hub) ---
+gateway_stack = GatewayStack(app, "OpenClawGateway", env=env)
 
 # --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
 router_stack = RouterStack(
