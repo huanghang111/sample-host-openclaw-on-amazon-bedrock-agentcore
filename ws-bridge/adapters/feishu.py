@@ -24,6 +24,27 @@ from ws_bridge.adapters.base import BotConfig, BotStatus, ChannelAdapter, Inboun
 logger = logging.getLogger("ws-bridge.feishu")
 
 MAX_TEXT_LEN = 20000
+
+# Magic byte signatures for image format detection
+_IMAGE_SIGNATURES = [
+    (b"\xff\xd8\xff",              "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n",        "image/png"),
+    (b"GIF87a",                    "image/gif"),
+    (b"GIF89a",                    "image/gif"),
+    # WebP: bytes 0-3 = "RIFF", bytes 8-11 = "WEBP"
+]
+
+
+def _detect_image_type(data: bytes) -> str:
+    """Detect image content type from magic bytes."""
+    for sig, ct in _IMAGE_SIGNATURES:
+        if data[:len(sig)] == sig:
+            return ct
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"  # safe default — most common format
+
+
 FEISHU_API_DOMAIN = "https://open.feishu.cn"
 
 # Serialize Feishu bot startup to avoid race condition on module-level loop patch.
@@ -43,6 +64,8 @@ class FeishuAdapter(ChannelAdapter):
         self._bot_name: str = ""
         self._bot_open_id: str = ""
         self._lark_client: lark.Client | None = None
+        self._user_name_cache: dict[str, str] = {}  # open_id -> display name
+        self._seen_events: dict[str, float] = {}  # event_id -> timestamp (dedup)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -136,6 +159,41 @@ class FeishuAdapter(ChannelAdapter):
         except Exception as e:
             logger.warning("bot=%s Failed to fetch bot info: %s", self.config.id, e)
 
+    def _get_user_name(self, open_id: str) -> str:
+        """Fetch Feishu user's display name via Contact API (cached).
+
+        Requires contact:user.base:readonly app permission.
+        Falls back to open_id if the API call fails.
+        """
+        if not open_id or not self._lark_client:
+            return open_id
+        cached = self._user_name_cache.get(open_id)
+        if cached is not None:
+            return cached
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest
+            req = (
+                GetUserRequest.builder()
+                .user_id(open_id)
+                .user_id_type("open_id")
+                .build()
+            )
+            resp = self._lark_client.contact.v3.user.get(req)
+            if resp.success() and resp.data and resp.data.user:
+                name = resp.data.user.name or ""
+                if name:
+                    self._user_name_cache[open_id] = name
+                    logger.info("bot=%s Resolved Feishu user name: %s -> %s",
+                                self.config.id, open_id[:20], name)
+                    return name
+            logger.info("bot=%s Could not resolve Feishu user name for %s: code=%s msg=%s",
+                        self.config.id, open_id[:20],
+                        resp.code if resp else "?", resp.msg if resp else "?")
+        except Exception as e:
+            logger.info("bot=%s Failed to fetch Feishu user name: %s", self.config.id, e)
+        self._user_name_cache[open_id] = open_id
+        return open_id
+
     # ------------------------------------------------------------------
     # Typing indicator (message reaction)
     # ------------------------------------------------------------------
@@ -200,6 +258,22 @@ class FeishuAdapter(ChannelAdapter):
     def _on_message(self, data):
         """Feishu event callback — runs in SDK's event loop thread."""
         try:
+            # Dedup by event_id — Feishu may redeliver events with different
+            # message_ids, causing stale downloads ("File not in msg" / 234003).
+            event_id = ""
+            if data.header and data.header.event_id:
+                event_id = data.header.event_id
+            if event_id:
+                now = time.time()
+                if event_id in self._seen_events:
+                    logger.info("bot=%s Skipping duplicate Feishu event %s", self.config.id, event_id)
+                    return
+                self._seen_events[event_id] = now
+                # Prune old entries
+                if len(self._seen_events) > 200:
+                    cutoff = now - 300
+                    self._seen_events = {k: v for k, v in self._seen_events.items() if v > cutoff}
+
             event = data.event
             message = event.message
             sender = event.sender
@@ -235,11 +309,12 @@ class FeishuAdapter(ChannelAdapter):
                 file_key = content.get("file_key", "")
                 file_name = content.get("file_name", "")
 
+            sender_open_id = sender.sender_id.open_id if sender.sender_id else ""
             msg = InboundMessage(
                 bot_id=self.config.id,
                 channel="feishu",
-                sender_id=sender.sender_id.open_id if sender.sender_id else "",
-                sender_name=sender.sender_id.open_id if sender.sender_id else "",
+                sender_id=sender_open_id,
+                sender_name=self._get_user_name(sender_open_id),
                 text=text,
                 message_id=message.message_id or "",
                 is_group=is_group,
@@ -528,10 +603,8 @@ class FeishuAdapter(ChannelAdapter):
                 if len(data) > max_bytes:
                     logger.warning("bot=%s Downloaded file exceeds size limit", self.config.id)
                     return None, ""
-                # Infer content type
-                content_type = "image/png"  # Feishu images are typically PNG
-                if download_code.endswith((".jpg", ".jpeg")):
-                    content_type = "image/jpeg"
+                # Detect content type from magic bytes (SDK doesn't expose HTTP headers)
+                content_type = _detect_image_type(data)
                 logger.info("bot=%s Downloaded from Feishu: %d bytes",
                             self.config.id, len(data))
                 return data, content_type

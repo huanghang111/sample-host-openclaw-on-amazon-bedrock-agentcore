@@ -158,6 +158,43 @@ def _get_feishu_tenant_token():
     return ""
 
 
+# Feishu user name cache (open_id -> display name)
+_feishu_user_name_cache: dict = {}
+
+
+def _get_feishu_user_name(open_id: str) -> str:
+    """Fetch Feishu user display name via Contact API (cached).
+
+    Requires contact:user.base:readonly app permission.
+    Falls back to open_id if the API call fails.
+    """
+    if not open_id:
+        return open_id
+    cached = _feishu_user_name_cache.get(open_id)
+    if cached is not None:
+        return cached
+    token = _get_feishu_tenant_token()
+    if not token:
+        return open_id
+    try:
+        url = f"{FEISHU_API_DOMAIN}/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
+        req = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        resp = urllib_request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        if result.get("code") == 0:
+            name = result.get("data", {}).get("user", {}).get("name", "")
+            if name:
+                _feishu_user_name_cache[open_id] = name
+                logger.info("Feishu: resolved user name %s -> %s", open_id[:20], name)
+                return name
+        logger.info("Feishu: could not resolve user name for %s: code=%s msg=%s",
+                    open_id[:20], result.get("code"), result.get("msg", ""))
+    except Exception as e:
+        logger.info("Feishu: failed to fetch user name for %s: %s", open_id[:20], e)
+    _feishu_user_name_cache[open_id] = open_id
+    return open_id
+
+
 # ---------------------------------------------------------------------------
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
@@ -415,7 +452,24 @@ def resolve_user(channel, channel_user_id, display_name=""):
     try:
         resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
         if "Item" in resp:
-            return resp["Item"]["userId"], False
+            user_id = resp["Item"]["userId"]
+            # Update displayName if a better name is now available
+            old_name = resp["Item"].get("displayName", "")
+            if display_name and display_name != old_name and display_name != channel_user_id:
+                try:
+                    identity_table.update_item(
+                        Key={"PK": pk, "SK": "PROFILE"},
+                        UpdateExpression="SET displayName = :n",
+                        ExpressionAttributeValues={":n": display_name})
+                    identity_table.update_item(
+                        Key={"PK": f"USER#{user_id}", "SK": "PROFILE"},
+                        UpdateExpression="SET displayName = :n",
+                        ExpressionAttributeValues={":n": display_name})
+                    logger.info("Updated displayName for %s: %s -> %s",
+                                channel_key, old_name, display_name)
+                except ClientError as e:
+                    logger.warning("Failed to update displayName: %s", e)
+            return user_id, False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
 
@@ -1709,9 +1763,10 @@ def handle_feishu(body, headers=None):
 
     # Handle bind commands BEFORE allowlist check
     actor_id = f"feishu:{sender_id}"
+    display_name = _get_feishu_user_name(sender_id)
     is_bind, code = _is_bind_command(text)
     if is_bind:
-        bound_user_id, success = redeem_bind_code(code, "feishu", sender_id)
+        bound_user_id, success = redeem_bind_code(code, "feishu", sender_id, display_name)
         if success:
             send_feishu_message(chat_id, "Accounts linked successfully! Your sessions are now unified.")
         else:
@@ -1719,7 +1774,7 @@ def handle_feishu(body, headers=None):
         return {"statusCode": 200, "body": "ok"}
 
     # Resolve user identity
-    resolved_user_id, is_new = resolve_user("feishu", sender_id)
+    resolved_user_id, is_new = resolve_user("feishu", sender_id, display_name)
 
     if resolved_user_id is None:
         send_feishu_message(

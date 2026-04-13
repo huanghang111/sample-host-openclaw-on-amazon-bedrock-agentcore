@@ -81,7 +81,24 @@ class IdentityService:
         try:
             resp = self.table.get_item(Key={"PK": pk, "SK": "PROFILE"})
             if "Item" in resp:
-                return resp["Item"]["userId"], False
+                user_id = resp["Item"]["userId"]
+                # Update displayName if a better name is now available
+                old_name = resp["Item"].get("displayName", "")
+                if display_name and display_name != old_name and display_name != channel_user_id:
+                    try:
+                        self.table.update_item(
+                            Key={"PK": pk, "SK": "PROFILE"},
+                            UpdateExpression="SET displayName = :n",
+                            ExpressionAttributeValues={":n": display_name})
+                        self.table.update_item(
+                            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"},
+                            UpdateExpression="SET displayName = :n",
+                            ExpressionAttributeValues={":n": display_name})
+                        logger.info("Updated displayName for %s: %s -> %s",
+                                    channel_key, old_name, display_name)
+                    except ClientError as e:
+                        logger.warning("Failed to update displayName: %s", e)
+                return user_id, False
         except ClientError as e:
             logger.error("DynamoDB get_item failed: %s", e)
 
