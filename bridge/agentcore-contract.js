@@ -1255,8 +1255,8 @@ async function bridgeMessage(message, timeoutMs = 620000) {
             id: connectReqId,
             method: "connect",
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              minProtocol: 4,
+              maxProtocol: 4,
               client: {
                 id: "openclaw-control-ui",
                 mode: "backend",
@@ -1315,15 +1315,28 @@ async function bridgeMessage(message, timeoutMs = 620000) {
         );
       };
 
-      // Step 3: Chat events — state: "delta" (streaming) or "final" (complete)
+      // Step 3: Chat events — state: "delta" (streaming), "replace" (full rewrite),
+      // or "final" (complete).
+      // Protocol v4 adds optional `deltaText` (additive increment) alongside the
+      // legacy `message` payload (cumulative snapshot). PR #80725.
       // OpenClaw puts content in payload.message.content (usual) or
       // directly in payload.message (string or content-blocks array).
       if (msg.type === "event" && msg.event === "chat") {
         const payload = msg.payload || {};
 
         if (payload.state === "delta") {
+          if (typeof payload.deltaText === "string" && payload.deltaText.length > 0) {
+            responseText += payload.deltaText;
+          } else {
+            const text = extractFromPayload(payload);
+            if (text) responseText = text; // Cumulative snapshot — replaces accumulator
+          }
+          return;
+        }
+
+        if (payload.state === "replace") {
           const text = extractFromPayload(payload);
-          if (text) responseText = text; // Delta replaces (accumulates progressively)
+          if (text) responseText = text;
           return;
         }
 
